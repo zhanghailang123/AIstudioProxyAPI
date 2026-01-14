@@ -170,102 +170,129 @@ class InputController(BaseController):
             raise
 
     async def _open_upload_menu_and_choose_file(self, files_list: List[str]) -> bool:
-        """通过'Insert assets'菜单选择'上传/Upload'项并打开文件选择器设置文件。"""
-        try:
-            # 若上一次菜单/对话的透明遮罩仍在，先尝试关闭
+        """通过'Insert assets'菜单选择'上传/Upload'项并打开文件选择器设置文件。
+        
+        由于 AI Studio 的 input[type=file] 不支持多文件上传，需要逐个上传。
+        """
+        if not files_list:
+            return True
+        
+        total_files = len(files_list)
+        uploaded_count = 0
+        
+        for idx, file_path in enumerate(files_list):
             try:
-                tb = self.page.locator(
-                    "div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop.cdk-overlay-backdrop-showing"
-                )
-                if await tb.count() > 0 and await tb.first.is_visible(timeout=300):
-                    await self.page.keyboard.press("Escape")
-                    await asyncio.sleep(0.2)
-            except Exception:
-                pass
-
-            trigger = self.page.locator(UPLOAD_BUTTON_SELECTOR).first
-            await expect_async(trigger).to_be_visible(timeout=3000)
-            await trigger.click()
-            menu_container = self.page.locator(CDK_OVERLAY_CONTAINER_SELECTOR)
-            # 等待菜单显示
-            try:
-                await expect_async(
-                    menu_container.locator("div[role='menu']").first
-                ).to_be_visible(timeout=3000)
-            except Exception:
-                # 再尝试一次触发
+                self.logger.info(f" 正在上传文件 {idx + 1}/{total_files}: {file_path}")
+                
+                # 若上一次菜单/对话的透明遮罩仍在，先尝试关闭
                 try:
-                    await trigger.click()
+                    tb = self.page.locator(
+                        "div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop.cdk-overlay-backdrop-showing"
+                    )
+                    if await tb.count() > 0 and await tb.first.is_visible(timeout=300):
+                        await self.page.keyboard.press("Escape")
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+                trigger = self.page.locator(UPLOAD_BUTTON_SELECTOR).first
+                await expect_async(trigger).to_be_visible(timeout=3000)
+                await trigger.click()
+                menu_container = self.page.locator(CDK_OVERLAY_CONTAINER_SELECTOR)
+                # 等待菜单显示
+                try:
                     await expect_async(
                         menu_container.locator("div[role='menu']").first
                     ).to_be_visible(timeout=3000)
                 except Exception:
-                    self.logger.warning(" 未能显示上传菜单面板。")
-                    return False
+                    # 再尝试一次触发
+                    try:
+                        await trigger.click()
+                        await expect_async(
+                            menu_container.locator("div[role='menu']").first
+                        ).to_be_visible(timeout=3000)
+                    except Exception:
+                        self.logger.warning(" 未能显示上传菜单面板。")
+                        continue
 
-            # 使用 aria-label 或文本匹配 'Upload a file' / 'Upload File' 的菜单项
-            try:
-                # 优先匹配新 UI: "Upload a file"
-                upload_btn = menu_container.locator(
-                    "div[role='menu'] button[role='menuitem'][aria-label='Upload a file']"
-                )
-                if await upload_btn.count() == 0:
-                    # 回退到旧 UI: "Upload File"
+                # 使用 aria-label 或文本匹配 'Upload a file' / 'Upload File' 的菜单项
+                try:
+                    # 优先匹配新 UI: "Upload a file"
                     upload_btn = menu_container.locator(
-                        "div[role='menu'] button[role='menuitem'][aria-label='Upload File']"
+                        "div[role='menu'] button[role='menuitem'][aria-label='Upload a file']"
                     )
-                if await upload_btn.count() == 0:
-                    # 退化到按文本匹配 (新 UI)
-                    upload_btn = menu_container.locator(
-                        "div[role='menu'] button[role='menuitem']:has-text('Upload a file')"
+                    if await upload_btn.count() == 0:
+                        # 回退到旧 UI: "Upload File"
+                        upload_btn = menu_container.locator(
+                            "div[role='menu'] button[role='menuitem'][aria-label='Upload File']"
+                        )
+                    if await upload_btn.count() == 0:
+                        # 退化到按文本匹配 (新 UI)
+                        upload_btn = menu_container.locator(
+                            "div[role='menu'] button[role='menuitem']:has-text('Upload a file')"
+                        )
+                    if await upload_btn.count() == 0:
+                        # 退化到按文本匹配 (旧 UI)
+                        upload_btn = menu_container.locator(
+                            "div[role='menu'] button[role='menuitem']:has-text('Upload File')"
+                        )
+                    if await upload_btn.count() == 0:
+                        self.logger.warning(" 未找到 'Upload a file' 或 'Upload File' 菜单项。")
+                        continue
+                    btn = upload_btn.first
+                    await expect_async(btn).to_be_visible(timeout=2000)
+                    # 优先使用内部隐藏 input[type=file]，只传单个文件
+                    input_loc = btn.locator('input[type="file"]')
+                    if await input_loc.count() > 0:
+                        await input_loc.set_input_files(file_path)  # 单个文件
+                        self.logger.info(
+                            f" 通过菜单项(Upload a file) 隐藏 input 设置文件成功: {file_path}"
+                        )
+                        uploaded_count += 1
+                    else:
+                        # 回退为原生文件选择器
+                        async with self.page.expect_file_chooser() as fc_info:
+                            await btn.click()
+                        file_chooser = await fc_info.value
+                        await file_chooser.set_files(file_path)  # 单个文件
+                        self.logger.info(
+                            f" 通过文件选择器设置文件成功: {file_path}"
+                        )
+                        uploaded_count += 1
+                except Exception as e_set:
+                    self.logger.error(f" 设置文件失败: {e_set}")
+                    continue
+                
+                # 关闭可能残留的菜单遮罩
+                try:
+                    backdrop = self.page.locator(
+                        "div.cdk-overlay-backdrop.cdk-overlay-backdrop-showing, div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop.cdk-overlay-backdrop-showing"
                     )
-                if await upload_btn.count() == 0:
-                    # 退化到按文本匹配 (旧 UI)
-                    upload_btn = menu_container.locator(
-                        "div[role='menu'] button[role='menuitem']:has-text('Upload File')"
-                    )
-                if await upload_btn.count() == 0:
-                    self.logger.warning(" 未找到 'Upload a file' 或 'Upload File' 菜单项。")
-                    return False
-                btn = upload_btn.first
-                await expect_async(btn).to_be_visible(timeout=2000)
-                # 优先使用内部隐藏 input[type=file]
-                input_loc = btn.locator('input[type="file"]')
-                if await input_loc.count() > 0:
-                    await input_loc.set_input_files(files_list)
-                    self.logger.info(
-                        f" 通过菜单项(Upload a file) 隐藏 input 设置文件成功: {len(files_list)} 个"
-                    )
-                else:
-                    # 回退为原生文件选择器
-                    async with self.page.expect_file_chooser() as fc_info:
-                        await btn.click()
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(files_list)
-                    self.logger.info(
-                        f" 通过文件选择器设置文件成功: {len(files_list)} 个"
-                    )
-            except Exception as e_set:
-                self.logger.error(f" 设置文件失败: {e_set}")
-                return False
-            # 关闭可能残留的菜单遮罩
-            try:
-                backdrop = self.page.locator(
-                    "div.cdk-overlay-backdrop.cdk-overlay-backdrop-showing, div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop.cdk-overlay-backdrop-showing"
-                )
-                if await backdrop.count() > 0:
-                    await self.page.keyboard.press("Escape")
-                    await asyncio.sleep(0.2)
-            except Exception:
-                pass
-            # 处理可能的授权弹窗
-            await self._handle_post_upload_dialog()
-            return True
-        except Exception as e:
-            if isinstance(e, asyncio.CancelledError):
-                raise
-            self.logger.error(f" 通过上传菜单设置文件失败: {e}")
+                    if await backdrop.count() > 0:
+                        await self.page.keyboard.press("Escape")
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+                
+                # 处理可能的授权弹窗
+                await self._handle_post_upload_dialog()
+                
+                # 等待较长时间让 UI 稳定，再上传下一个文件（AI Studio 处理大量文件时较慢）
+                if idx < total_files - 1:
+                    await asyncio.sleep(2.0)
+                    
+            except Exception as e:
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                self.logger.error(f" 上传文件 {file_path} 失败: {e}")
+                continue
+        
+        if uploaded_count == 0:
+            self.logger.error(f" 所有 {total_files} 个文件上传失败")
             return False
+        
+        self.logger.info(f" 文件上传完成: 成功 {uploaded_count}/{total_files} 个")
+        return True
 
     async def _handle_post_upload_dialog(self):
         """处理上传后可能出现的授权/版权确认对话框，优先点击同意类按钮，不主动关闭重要对话框。"""
