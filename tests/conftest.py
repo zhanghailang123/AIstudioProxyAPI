@@ -32,14 +32,26 @@ def reset_global_state():
     from config.global_state import GlobalState
 
     GlobalState.reset_quota_status()
+    # Ensure asyncio events are initialized (init_rotation_lock may not have run).
+    # In sync tests there may be no event loop, so guard against RuntimeError.
+    if GlobalState.AUTH_ROTATION_LOCK is None:
+        try:
+            GlobalState.init_rotation_lock()
+        except RuntimeError:
+            pass  # No event loop in sync context; events stay None
     GlobalState.IS_RECOVERING = False
     GlobalState.DEPLOYMENT_EMERGENCY_MODE = False
     GlobalState.CURRENT_STREAM_REQ_ID = None
     GlobalState.queued_request_count = 0
-    GlobalState.AUTH_ROTATION_LOCK.set()  # Allow requests by default
-    GlobalState.QUOTA_EXCEEDED_EVENT.clear()
-    GlobalState.rotation_complete_event.clear()
-    GlobalState.RECOVERY_EVENT.set()
+    # Guard: events may still be None in sync tests without an event loop
+    if GlobalState.AUTH_ROTATION_LOCK is not None:
+        GlobalState.AUTH_ROTATION_LOCK.set()  # Allow requests by default
+    if GlobalState.QUOTA_EXCEEDED_EVENT is not None:
+        GlobalState.QUOTA_EXCEEDED_EVENT.clear()
+    if GlobalState.rotation_complete_event is not None:
+        GlobalState.rotation_complete_event.clear()
+    if GlobalState.RECOVERY_EVENT is not None:
+        GlobalState.RECOVERY_EVENT.set()
     GlobalState.IS_SHUTTING_DOWN.clear()
 
     state.reset()

@@ -14,6 +14,7 @@ from config import CHAT_COMPLETION_ID_PREFIX
 from config.global_state import GlobalState
 from logging_utils import set_request_id
 from models import (
+    AIStudioPermissionDeniedError,
     ChatCompletionRequest,
     ClientDisconnectedError,
     QuotaExceededError,
@@ -64,6 +65,11 @@ async def resilient_stream_generator(
     retry_count = 0
 
     inner_event = Event()
+    # Track the rotation task so we can cancel it if the generator returns
+    # (e.g. on timeout) before the rotation completes. Without this, the
+    # background task continues holding AUTH_ROTATION_LOCK, causing the
+    # queue_worker cleanup to hang when it calls perform_auth_rotation.
+    rotation_task = None
 
     try:
         while retry_count <= max_retries:
@@ -99,6 +105,14 @@ async def resilient_stream_generator(
                     if time.time() - rotation_start > 120:
                         logger.error(f"[{req_id}] Rotation timed out.")
                         yield f"data: {json.dumps({'error': 'Auth rotation timed out.'}, ensure_ascii=False)}\n\n"
+                        # Cancel the background rotation task before returning.
+                        # Otherwise it keeps running and holds AUTH_ROTATION_LOCK,
+                        # which causes the queue_worker cleanup to hang.
+                        rotation_task.cancel()
+                        try:
+                            await rotation_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                         return
 
                     yield ": processing auth rotation...\n\n"
@@ -118,6 +132,15 @@ async def resilient_stream_generator(
             except Exception:
                 raise
     finally:
+        # Cancel any lingering rotation task to prevent it from holding
+        # AUTH_ROTATION_LOCK indefinitely after the generator has returned.
+        if rotation_task is not None and not rotation_task.done():
+            rotation_task.cancel()
+            try:
+                await rotation_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         if not completion_event.is_set():
             completion_event.set()
             logger.info(f"[{req_id}] Resilient stream completion event set")
@@ -426,6 +449,8 @@ async def gen_sse_from_aux_stream(
 
     except (QuotaExceededError, QuotaExceededRetry):
         raise
+    except AIStudioPermissionDeniedError:
+        raise
     except ClientDisconnectedError:
         logger.info(f"[{req_id}] Client disconnected in stream generator")
         if data_receiving and not event_to_set.is_set():
@@ -589,6 +614,8 @@ async def gen_sse_from_playwright(
                 req_id, model_name_for_stream, "stop", usage_stats
             )
     except (QuotaExceededError, QuotaExceededRetry):
+        raise
+    except AIStudioPermissionDeniedError:
         raise
     except ClientDisconnectedError:
         if data_receiving and not completion_event.is_set():

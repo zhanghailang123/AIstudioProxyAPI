@@ -14,6 +14,178 @@ TOOL_STRUCTURE_PATTERN = re.compile(
 )
 
 
+def _classify_ai_studio_error_text(text: str) -> str:
+    """将页面错误文本分类，避免权限拒绝误触发额度轮换。"""
+    lower = (text or "").lower()
+    if (
+        "permission denied" in lower
+        or "caller does not have permission" in lower
+        or "forbidden" in lower
+        or "403" in lower
+    ):
+        return "permission"
+    if (
+        "quota" in lower
+        or "resource_exhausted" in lower
+        or "resource has been exhausted" in lower
+        or "rate limit" in lower
+        or "too many requests" in lower
+        or "429" in lower
+    ):
+        return "quota"
+    return "upstream"
+
+
+def _raise_ai_studio_page_error(
+    req_id: str,
+    message: str,
+    *,
+    prefix: str = "AI Studio page error",
+) -> None:
+    from models import AIStudioPermissionDeniedError, QuotaExceededError, UpstreamError
+
+    cleaned = str(message)[:500]
+    category = _classify_ai_studio_error_text(cleaned)
+    if category == "permission":
+        raise AIStudioPermissionDeniedError(f"{prefix}: {cleaned}", req_id=req_id)
+    if category == "quota":
+        raise QuotaExceededError(f"{prefix}: {cleaned}", req_id=req_id)
+    raise UpstreamError(f"{prefix}: {cleaned}", req_id=req_id)
+
+
+async def _try_dom_response_fallback(
+    req_id: str,
+    page: Any,
+    logger: Any,
+    check_client_disconnected: Optional[Callable],
+) -> Optional[str]:
+    """DOM-based response extraction fallback.
+
+    Called when the MITM proxy is bypassed (passthrough) for GenerateContent
+    hosts and the stream queue is empty. Waits for the AI Studio page to render
+    the response and extracts it from the DOM.
+
+    Also checks for page-level AI Studio errors and raises the matching
+    upstream exception without treating permission denials as quota.
+
+    Returns:
+        Response text string, or None if extraction fails.
+    """
+    if not page:
+        return None
+
+    try:
+        from browser_utils.operations import (
+            _get_final_response_content,
+            _wait_for_response_completion,
+        )
+        from config import (
+            EDIT_MESSAGE_BUTTON_SELECTOR,
+            PROMPT_TEXTAREA_SELECTOR,
+            SUBMIT_BUTTON_SELECTOR,
+        )
+        from models import (
+            AIStudioPermissionDeniedError,
+            ClientDisconnectedError,
+            QuotaExceededError,
+            UpstreamError,
+        )
+
+        check_disco = check_client_disconnected or (lambda _: None)
+
+        # 页面错误提前分类；权限拒绝不能当作额度耗尽。
+        async def _check_page_error() -> None:
+            try:
+                error_text = await page.evaluate(
+                    """
+                    () => {
+                        if (!document.body) return null;
+                        const text = document.body.innerText || '';
+                        const lower = text.toLowerCase();
+                        if (lower.includes('permission denied') ||
+                            lower.includes('caller does not have permission') ||
+                            lower.includes('please try again') ||
+                            lower.includes('quota') ||
+                            lower.includes('forbidden') ||
+                            lower.includes('resource_exhausted') ||
+                            lower.includes('rate limit') ||
+                            lower.includes('internal error')) {
+                            return text.substring(0, 500);
+                        }
+                        return null;
+                    }
+                    """
+                )
+                if error_text:
+                    logger.warning(
+                        f"[{req_id}] DOM error detected: {error_text[:200]}"
+                    )
+                    _raise_ai_studio_page_error(
+                        req_id,
+                        error_text,
+                        prefix="AI Studio error detected on page",
+                    )
+            except (AIStudioPermissionDeniedError, QuotaExceededError, UpstreamError):
+                raise
+            except Exception:
+                pass
+
+        # Initial error check before waiting
+        await _check_page_error()
+
+        prompt_textarea = page.locator(PROMPT_TEXTAREA_SELECTOR)
+        submit_button = page.locator(SUBMIT_BUTTON_SELECTOR)
+        edit_button = page.locator(EDIT_MESSAGE_BUTTON_SELECTOR)
+
+        logger.info(f"[{req_id}] DOM fallback: Waiting for response completion...")
+        completion_detected = await _wait_for_response_completion(
+            page,
+            prompt_textarea,
+            submit_button,
+            edit_button,
+            req_id,
+            check_disco,
+        )
+
+        if not completion_detected:
+            logger.warning(
+                f"[{req_id}] DOM fallback: completion not detected, checking for errors..."
+            )
+            # Check for errors again after timeout
+            await _check_page_error()
+
+        final_content = await _get_final_response_content(
+            page, req_id, check_disco
+        )
+
+        if final_content and final_content.strip():
+            return final_content
+
+        # Last resort: try raw DOM text extraction
+        from browser_utils.page_controller import PageController
+
+        pc = PageController(page, logger, req_id)
+        dom_text = await pc.get_body_text_only_from_dom()
+        if dom_text and dom_text.strip():
+            return dom_text
+
+        logger.warning(
+            f"[{req_id}] DOM fallback: all extraction methods returned empty"
+        )
+        return None
+
+    except (
+        AIStudioPermissionDeniedError,
+        ClientDisconnectedError,
+        QuotaExceededError,
+        UpstreamError,
+    ):
+        raise
+    except Exception as e:
+        logger.error(f"[{req_id}] DOM fallback error: {e}", exc_info=True)
+        return None
+
+
 async def use_stream_response(
     req_id: str,
     timeout: float = 5.0,
@@ -37,6 +209,7 @@ async def use_stream_response(
     )
     from config.global_state import GlobalState
     from models import (
+        AIStudioPermissionDeniedError,
         ClientDisconnectedError,
         QuotaExceededError,
         UpstreamError,
@@ -62,7 +235,11 @@ async def use_stream_response(
     force_body_mode = False
     split_index = -1
     empty_count = 0
-    initial_wait_limit = int(timeout * 10)
+    # Cap initial wait at 100 iterations (10s). In passthrough mode the MITM
+    # proxy is bypassed for GenerateContent hosts so the stream queue will
+    # NEVER receive data; without this cap the system would poll for up to
+    # timeout*10 iterations (e.g. 3000 = 5 min) before falling back to DOM.
+    initial_wait_limit = min(int(timeout * 10), 100)
     silence_wait_limit = int(silence_threshold * 10)
     max_empty_retries = max(silence_wait_limit, initial_wait_limit)
     hard_timeout_limit = int(timeout * 10 * 3)
@@ -204,9 +381,27 @@ async def use_stream_response(
                     if actual_data.get("error"):
                         status = actual_data.get("status", 500)
                         message = actual_data.get("message", "Unknown error")
-                        if status == 429 or "quota" in message.lower():
+                        msg_lower = message.lower()
+                        # 权限拒绝不是额度耗尽；只有明确 quota/rate limit 才轮换。
+                        if (
+                            status == 429
+                            or "quota" in msg_lower
+                            or "resource_exhausted" in msg_lower
+                            or "rate limit" in msg_lower
+                            or "too many requests" in msg_lower
+                        ):
                             raise QuotaExceededError(
                                 f"AI Studio quota exceeded: {message}", req_id=req_id
+                            )
+                        elif (
+                            status == 403
+                            or "forbidden" in msg_lower
+                            or "permission denied" in msg_lower
+                            or "caller does not have permission" in msg_lower
+                        ):
+                            raise AIStudioPermissionDeniedError(
+                                f"AI Studio permission denied: {message}",
+                                req_id=req_id,
                             )
                         else:
                             raise UpstreamError(
@@ -399,11 +594,57 @@ async def use_stream_response(
                     if GlobalState.IS_RECOVERING:
                         empty_count = 0
                         continue
+                    # --- Pre-snooze page error check ---
+                    # Before snoozing, ALWAYS check for page-level errors.
+                    # The UI may show "generating" (stop button visible / submit
+                    # disabled) alongside a "permission denied" error banner.
+                    # Without this check the snooze logic would loop forever.
+                    if page and received_items_count == 0:
+                        try:
+                            _pre_snooze_err = await page.evaluate(
+                                """() => {
+                                    const t = document.body && document.body.innerText || '';
+                                    const l = t.toLowerCase();
+                                    if (l.includes('permission denied') ||
+                                        l.includes('caller does not have permission') ||
+                                        l.includes('please try again') ||
+                                        l.includes('failed to generate') ||
+                                        l.includes('resource_exhausted') ||
+                                        l.includes('rate limit') ||
+                                        l.includes('internal error')) {
+                                        return t.substring(0, 500);
+                                    }
+                                    return null;
+                                }"""
+                            )
+                            if _pre_snooze_err:
+                                logger.warning(
+                                    f"[{req_id}] 🚨 Page error before snooze: "
+                                    f"{str(_pre_snooze_err)[:200]}"
+                                )
+                                _raise_ai_studio_page_error(
+                                    req_id,
+                                    _pre_snooze_err,
+                                    prefix="AI Studio page error (pre-snooze)",
+                                )
+                        except Exception as _pse:
+                            if isinstance(
+                                _pse,
+                                (
+                                    AIStudioPermissionDeniedError,
+                                    QuotaExceededError,
+                                    UpstreamError,
+                                ),
+                            ):
+                                raise
                     if (
                         await check_ui_generation_active()
                         and empty_count < hard_timeout_limit
                     ):
-                        logger.warning(f"[{req_id}] Timeout but UI active. Snoozing...")
+                        logger.warning(
+                            f"[{req_id}] Timeout but UI active "
+                            f"({empty_count}/{max_empty_retries}). Snoozing..."
+                        )
                         empty_count = max(0, empty_count - int(max_empty_retries * 0.5))
                         continue
                     elif empty_count >= hard_timeout_limit:
@@ -427,7 +668,95 @@ async def use_stream_response(
                         check_client_disconnected(f"Stream Queue Wait ({req_id})")
                     except ClientDisconnectedError:
                         raise
+                # Quick page-level error check (permission denied, quota, etc.)
+                # In passthrough mode the stream queue is empty so we must poll
+                # the DOM to detect errors that Google shows on the page.
+                # Check at 10, 20, 30, 50, then every 50 iterations after.
+                # 10 iterations ≈ 1s — catches "permission denied" almost
+                # immediately after the page renders the error banner.
+                if (
+                    received_items_count == 0
+                    and page
+                    and empty_count > 0
+                    and (
+                        empty_count in (10, 20, 30)
+                        or empty_count % 50 == 0
+                    )
+                ):
+                    try:
+                        page_err = await page.evaluate(
+                            """() => {
+                                const t = document.body && document.body.innerText || '';
+                                const l = t.toLowerCase();
+                                if (l.includes('permission denied') ||
+                                    l.includes('caller does not have permission') ||
+                                    l.includes('please try again') ||
+                                    l.includes('failed to generate') ||
+                                    l.includes('resource_exhausted') ||
+                                    l.includes('rate limit') ||
+                                    l.includes('internal error')) {
+                                    return t.substring(0, 500);
+                                }
+                                return null;
+                            }"""
+                        )
+                        if page_err:
+                            logger.warning(
+                                f"[{req_id}] 🚨 Page error detected early "
+                                f"(iter {empty_count}): "
+                                f"{str(page_err)[:200]}"
+                            )
+                            _raise_ai_studio_page_error(
+                                req_id,
+                                page_err,
+                                prefix="AI Studio page error",
+                            )
+                    except Exception as _pe:
+                        if isinstance(
+                            _pe,
+                            (
+                                AIStudioPermissionDeniedError,
+                                QuotaExceededError,
+                                UpstreamError,
+                            ),
+                        ):
+                            raise
                 if received_items_count == 0 and empty_count >= initial_wait_limit:
+                    # DOM FALLBACK: When MITM proxy is bypassed for GenerateContent
+                    # (to preserve browser TLS fingerprint), the stream queue will be
+                    # empty. Fall back to DOM-based response extraction.
+                    logger.info(
+                        f"[{req_id}] No stream data (MITM bypassed?). Trying DOM fallback..."
+                    )
+                    dom_content = await _try_dom_response_fallback(
+                        req_id, page, logger, check_client_disconnected
+                    )
+                    if dom_content is not None:
+                        logger.info(
+                            f"[{req_id}] DOM fallback succeeded: {len(dom_content)} chars"
+                        )
+                        # Detect function calls from DOM for tool-call support
+                        dom_functions: List[dict] = []
+                        try:
+                            dom_functions, _ = await detect_function_calls_from_dom(
+                                page, req_id, logger
+                            )
+                        except Exception:
+                            pass
+                        yield {
+                            "body": dom_content,
+                            "reason": "",
+                            "function": dom_functions if dom_functions else [],
+                            "done": False,
+                        }
+                        yield {
+                            "body": "",
+                            "reason": "",
+                            "function": [],
+                            "done": True,
+                        }
+                        return
+                    # DOM fallback failed — fall through to original TTFB timeout
                     logger.error(f"[{req_id}] Stream has no data (TTFB Timeout).")
                     try:
                         from api_utils.server_state import state

@@ -1,5 +1,6 @@
 # --- browser_utils/initialization/core.py ---
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -39,10 +40,69 @@ from .network import setup_network_interception_and_scripts
 logger = logging.getLogger("AIStudioProxyServer")
 
 
+def _is_truthy_env(name: str, default: bool = False) -> bool:
+    """读取布尔环境变量，兼容常见开关写法。"""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _iter_browser_contexts(browser: AsyncBrowser) -> list[AsyncBrowserContext]:
+    """安全读取已连接浏览器中的上下文列表。"""
+    contexts = getattr(browser, "contexts", [])
+    if inspect.isawaitable(contexts):
+        logger.debug("[BrowserReuse] Ignoring awaitable browser contexts value.")
+        return []
+    if isinstance(contexts, (list, tuple)):
+        return list(contexts)
+    if callable(contexts):
+        logger.debug("[BrowserReuse] Ignoring callable browser contexts value.")
+    return []
+
+
+def _match_ai_studio_prompt_page(
+    page: AsyncPage, target_url_base: str
+) -> Optional[str]:
+    """判断页面是否为可复用的 AI Studio prompt 页面。"""
+    try:
+        if page.is_closed():
+            return None
+        page_url = page.url or ""
+        if target_url_base in page_url and "/prompts/" in page_url:
+            return page_url
+    except PlaywrightAsyncError as pw_err_url:
+        logger.warning(f"Playwright error checking existing page URL: {pw_err_url}")
+    except AttributeError as attr_err_url:
+        logger.warning(f"Attribute error checking existing page URL: {attr_err_url}")
+    except Exception as e_url_check:
+        logger.warning(
+            f"Unexpected error checking existing page URL: {e_url_check} "
+            f"(Type: {type(e_url_check).__name__})"
+        )
+    return None
+
+
+def _find_existing_ai_studio_page(
+    browser: AsyncBrowser, target_url_base: str
+) -> Optional[Tuple[AsyncBrowserContext, AsyncPage, str]]:
+    """在已有浏览器上下文中寻找手动打开的 AI Studio 页面。"""
+    for context in _iter_browser_contexts(browser):
+        pages = getattr(context, "pages", [])
+        if not isinstance(pages, (list, tuple)):
+            continue
+        for page in pages:
+            page_url = _match_ai_studio_prompt_page(page, target_url_base)
+            if page_url:
+                return context, page, page_url
+    return None
+
+
 async def _wait_for_shutdown():
     """Helper to wait for GlobalState.IS_SHUTTING_DOWN event."""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, GlobalState.IS_SHUTTING_DOWN.wait)
+    # 避免 run_in_executor 残留阻塞线程，取消任务时可立即退出。
+    while not GlobalState.IS_SHUTTING_DOWN.is_set():
+        await asyncio.sleep(0.1)
 
 
 async def initialize_page_logic(  # pragma: no cover
@@ -57,9 +117,11 @@ async def initialize_page_logic(  # pragma: no cover
     """
     logger.debug("[Init] Initializing page logic")
     temp_context: Optional[AsyncBrowserContext] = None
+    owns_temp_context = False
     storage_state_path_to_use: Optional[str] = None
     launch_mode = os.environ.get("LAUNCH_MODE", "debug")
     loop = asyncio.get_running_loop()
+    reuse_existing_page = _is_truthy_env("REUSE_EXISTING_AISTUDIO_PAGE", False)
 
     # Prioritize the passed storage_state_path
     if storage_state_path:
@@ -171,51 +233,7 @@ async def initialize_page_logic(  # pragma: no cover
             )
 
     try:
-        # Consolidate into one log message
-        auth_file = (
-            os.path.basename(storage_state_path_to_use)
-            if storage_state_path_to_use
-            else None
-        )
-        context_options: Dict[str, Any] = {"viewport": {"width": 460, "height": 800}}
-        if storage_state_path_to_use:
-            context_options["storage_state"] = storage_state_path_to_use
-            from api_utils.server_state import state
-
-            state.current_auth_profile_path = storage_state_path_to_use
-            logger.info(
-                f"   (Using storage_state='{os.path.basename(storage_state_path_to_use)}')"
-            )
-        else:
-            from api_utils.server_state import state
-
-            state.current_auth_profile_path = None
-            logger.info("   (Not using storage_state)")
-
-        # Proxy settings need to be retrieved from the server module
-        from api_utils.server_state import state
-
-        if state.PLAYWRIGHT_PROXY_SETTINGS:
-            context_options["proxy"] = state.PLAYWRIGHT_PROXY_SETTINGS
-            logger.debug(
-                f"[Browser] Context configured with proxy: {state.PLAYWRIGHT_PROXY_SETTINGS['server']}"
-            )
-
-        context_options["ignore_https_errors"] = True
-
-        # Single consolidated log
-        if auth_file:
-            logger.info(f"[Browser] Context created (Auth: {auth_file})")
-        else:
-            logger.debug("[Browser] Context created (No Auth)")
-
-        temp_context = await browser.new_context(**context_options)
-
-        # Set up network interception and script injection
-        await setup_network_interception_and_scripts(temp_context)
-
         found_page: Optional[AsyncPage] = None
-        pages = temp_context.pages
         target_url_base = f"https://{AI_STUDIO_URL_PATTERN}"
         target_full_url = f"{target_url_base}prompts/new_chat"
         login_url_pattern = "accounts.google.com"
@@ -224,35 +242,98 @@ async def initialize_page_logic(  # pragma: no cover
         # Import _handle_model_list_response - delayed import to avoid circular dependency
         from browser_utils.operations import _handle_model_list_response
 
-        for p_iter in pages:
-            try:
-                page_url_to_check = p_iter.url
-                if (
-                    not p_iter.is_closed()
-                    and target_url_base in page_url_to_check
-                    and "/prompts/" in page_url_to_check
-                ):
+        if reuse_existing_page:
+            existing_match = _find_existing_ai_studio_page(browser, target_url_base)
+            if existing_match:
+                temp_context, found_page, current_url = existing_match
+                logger.info(
+                    "[BrowserReuse] Reusing existing AI Studio page from connected browser: "
+                    f"{current_url}"
+                )
+                try:
+                    await setup_network_interception_and_scripts(temp_context)
+                except Exception as reuse_setup_err:
+                    logger.warning(
+                        f"[BrowserReuse] Setup on reused context failed: {reuse_setup_err}"
+                    )
+                found_page.on("response", _handle_model_list_response)
+                setup_debug_listeners(found_page)
+                from api_utils.server_state import state
+
+                state.current_auth_profile_path = None
+                logger.info(
+                    "[BrowserReuse] storage_state skipped; using live browser context."
+                )
+            else:
+                logger.info(
+                    "[BrowserReuse] No existing AI Studio prompt page found; "
+                    "creating a fresh context."
+                )
+
+        if not found_page:
+            # Consolidate into one log message
+            auth_file = (
+                os.path.basename(storage_state_path_to_use)
+                if storage_state_path_to_use
+                else None
+            )
+            context_options: Dict[str, Any] = {
+                "viewport": {"width": 460, "height": 800}
+            }
+            if storage_state_path_to_use:
+                context_options["storage_state"] = storage_state_path_to_use
+                from api_utils.server_state import state
+
+                state.current_auth_profile_path = storage_state_path_to_use
+                logger.info(
+                    f"   (Using storage_state='{os.path.basename(storage_state_path_to_use)}')"
+                )
+            else:
+                from api_utils.server_state import state
+
+                state.current_auth_profile_path = None
+                logger.info("   (Not using storage_state)")
+
+            # Proxy settings need to be retrieved from the server module
+            from api_utils.server_state import state
+
+            if state.PLAYWRIGHT_PROXY_SETTINGS:
+                context_options["proxy"] = state.PLAYWRIGHT_PROXY_SETTINGS
+                logger.debug(
+                    f"[Browser] Context configured with proxy: {state.PLAYWRIGHT_PROXY_SETTINGS['server']}"
+                )
+
+            context_options["ignore_https_errors"] = True
+
+            # Single consolidated log
+            if auth_file:
+                logger.info(f"[Browser] Context created (Auth: {auth_file})")
+            else:
+                logger.debug("[Browser] Context created (No Auth)")
+
+            temp_context = await browser.new_context(**context_options)
+            owns_temp_context = True
+
+            # Set up network interception and script injection
+            await setup_network_interception_and_scripts(temp_context)
+
+            pages = temp_context.pages
+
+            for p_iter in pages:
+                page_url_to_check = _match_ai_studio_prompt_page(
+                    p_iter, target_url_base
+                )
+                if page_url_to_check:
                     found_page = p_iter
                     current_url = page_url_to_check
                     logger.debug(f"Found opened AI Studio page: {current_url}")
-                    if found_page:
-                        logger.debug(
-                            f"Adding model list response listener to existing page {found_page.url}."
-                        )
-                        found_page.on("response", _handle_model_list_response)
-                        # Setup debug listeners for error snapshots
-                        setup_debug_listeners(found_page)
+                    logger.debug(
+                        f"Adding model list response listener to existing page {found_page.url}."
+                    )
+                    found_page.on("response", _handle_model_list_response)
+                    # Setup debug listeners for error snapshots
+                    setup_debug_listeners(found_page)
                     break
-            except PlaywrightAsyncError as pw_err_url:
-                logger.warning(f"Playwright error checking page URL: {pw_err_url}")
-            except AttributeError as attr_err_url:
-                logger.warning(f"Attribute error checking page URL: {attr_err_url}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e_url_check:
-                logger.warning(
-                    f"   Other unexpected error checking page URL: {e_url_check} (Type: {type(e_url_check).__name__})"
-                )
 
         if not found_page:
             logger.info(f"[Navigation] Opening new page: {target_full_url}")
@@ -446,6 +527,31 @@ async def initialize_page_logic(  # pragma: no cover
             logger.info(
                 f"[Page] Logic initialization successful | Current Model: {model_name_on_page}"
             )
+
+            # ── Anti-automation verification ──────────────────────────────────
+            # Verify that the anti-CDP-detection init script actually patched
+            # navigator.webdriver.  If it's still True, Google's AI Studio
+            # frontend will detect automation and return 403 "permission denied".
+            try:
+                webdriver_val = await found_page.evaluate(
+                    "() => navigator.webdriver"
+                )
+                if webdriver_val:
+                    logger.warning(
+                        "[AntiDetect] ⚠ navigator.webdriver is STILL TRUE! "
+                        "Anti-automation init script may not have run. "
+                        "403 errors are likely."
+                    )
+                else:
+                    logger.info(
+                        "[AntiDetect] ✓ navigator.webdriver = false "
+                        "(anti-automation patch verified)"
+                    )
+            except Exception as _verify_err:
+                logger.debug(
+                    f"[AntiDetect] Could not verify webdriver patch: {_verify_err}"
+                )
+
             return result_page_instance, result_page_ready
         except asyncio.CancelledError:
             raise
@@ -462,7 +568,7 @@ async def initialize_page_logic(  # pragma: no cover
             ) from input_visible_err
     except asyncio.CancelledError:
         logger.warning("Page initialization cancelled.")
-        if temp_context:
+        if owns_temp_context and temp_context:
             try:
                 await temp_context.close()
             except asyncio.CancelledError:
@@ -475,7 +581,7 @@ async def initialize_page_logic(  # pragma: no cover
             f"Serious unexpected error during page logic initialization: {e_init_page}",
             exc_info=True,
         )
-        if temp_context:
+        if owns_temp_context and temp_context:
             try:
                 logger.info(
                     "   Attempting to close temporary browser context due to initialization error."
@@ -627,6 +733,11 @@ async def enable_temporary_chat_mode(page: AsyncPage) -> bool:  # pragma: no cov
     Check and enable "Temporary chat" mode in the AI Studio interface.
     Supports both direct UI visibility and collapsed menu visibility.
     """
+    # 若配置为不启用临时聊天，则直接跳过
+    if os.environ.get("ENABLE_TEMPORARY_CHAT", "true").lower() in ("false", "0", "no"):
+        logger.debug("[UI] Temporary chat mode is disabled by configuration.")
+        return False
+
     incognito_selector = (
         "button[data-test-incognito-toggle], "
         'button[aria-label="Temporary chat toggle"], '

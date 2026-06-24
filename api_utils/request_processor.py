@@ -30,6 +30,7 @@ from browser_utils.page_controller import PageController
 
 # --- Configuration Module Imports ---
 from config import (
+    INCLUDE_REASONING_IN_OPENAI_OUTPUT,
     MODEL_NAME,
     RESPONSE_COMPLETION_TIMEOUT,
     SUBMIT_BUTTON_SELECTOR,
@@ -43,6 +44,7 @@ from logging_utils import log_context
 
 # --- models Module Imports ---
 from models import (
+    AIStudioPermissionDeniedError,
     ChatCompletionRequest,
     ClientDisconnectedError,
     QuotaExceededError,
@@ -392,7 +394,7 @@ async def _handle_auxiliary_stream_response(
 
         # Consolidate reasoning content with body content
         consolidated_content = ""
-        if reasoning_content and reasoning_content.strip():
+        if INCLUDE_REASONING_IN_OPENAI_OUTPUT and reasoning_content and reasoning_content.strip():
             consolidated_content += reasoning_content.strip()
         if content and content.strip():
             if consolidated_content:
@@ -558,7 +560,7 @@ async def _handle_playwright_response(
             )
 
         consolidated_content = ""
-        if reasoning_content and reasoning_content.strip():
+        if INCLUDE_REASONING_IN_OPENAI_OUTPUT and reasoning_content and reasoning_content.strip():
             consolidated_content += reasoning_content.strip()
         if final_content and final_content.strip():
             if consolidated_content:
@@ -877,6 +879,17 @@ async def _process_request_refactored(
         if "stop" in request.model_fields_set and request.stop is None:
             request_params["stop"] = None
 
+        logger.info(
+            f"[{req_id}] Submit summary: model={request.model or MODEL_NAME}, "
+            f"prompt_chars={len(prepared_prompt)}, attachments={len(attachments_list)}, "
+            f"tools={len(request.tools or []) if getattr(request, 'tools', None) else 0}, "
+            f"stop_set={'stop' in request.model_fields_set}, "
+            f"reasoning_effort={request_params.get('reasoning_effort')}, "
+            f"temperature={request_params.get('temperature')}, "
+            f"top_p={request_params.get('top_p')}, "
+            f"max_output_tokens={request_params.get('max_output_tokens')}"
+        )
+
         with log_context("Adjusting Parameters", context["logger"], silent=True):
             await page_controller.adjust_parameters(
                 request_params,
@@ -951,6 +964,11 @@ async def _process_request_refactored(
         if not GlobalState.IS_QUOTA_EXCEEDED:
             GlobalState.set_quota_exceeded(message=str(quota_err))
         raise quota_err
+    except AIStudioPermissionDeniedError as permission_err:
+        logger.error(f"[{req_id}] AI Studio permission denied: {permission_err}")
+        if not result_future.done():
+            result_future.set_exception(upstream_error(req_id, str(permission_err)))
+        raise
     except PlaywrightAsyncError as pw_err:
         logger.error(f"[{req_id}] Playwright error: {pw_err}")
         await save_error_snapshot(f"process_pw_error_{req_id}")

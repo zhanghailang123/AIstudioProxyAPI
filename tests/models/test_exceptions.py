@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 from models.exceptions import (
     AIStudioError,
+    AIStudioPermissionDeniedError,
     # Base
     AIStudioProxyError,
     BrowserCrashedError,
@@ -309,6 +310,15 @@ def test_quota_exceeded_error():
 
     assert error.retry_after == 3600  # 1 hour
     assert "quota exceeded" in error.message.lower()
+
+
+def test_ai_studio_permission_denied_error():
+    """权限拒绝应保持为上游错误，不走额度异常。"""
+    error = AIStudioPermissionDeniedError(req_id="req_permission")
+
+    assert error.http_status == 502
+    assert error.retry_after == 10
+    assert "permission denied" in error.message.lower()
 
 
 def test_empty_response_error():

@@ -21,15 +21,14 @@ class GlobalState:
     NEEDS_ROTATION = False  # [GR-01] Soft Signal Flag
     QUOTA_EXCEEDED_TIMESTAMP = 0.0
 
-    # Global Event for holding requests during auth rotation
-    # Initially set to True (allowed) by init_rotation_lock()
-    AUTH_ROTATION_LOCK = asyncio.Event()
+    # 用于在轮转期间暂停请求的全局事件
+    AUTH_ROTATION_LOCK: Optional[asyncio.Event] = None
 
-    # Global Event to signal Quota Exceeded immediately
-    QUOTA_EXCEEDED_EVENT = asyncio.Event()
+    # 用于触发额度超限信号的全局事件
+    QUOTA_EXCEEDED_EVENT: Optional[asyncio.Event] = None
 
-    # Event to signal that a rotation operation has completed.
-    rotation_complete_event = asyncio.Event()
+    # 用于通知轮转完成的全局事件
+    rotation_complete_event: Optional[asyncio.Event] = None
 
     # Track the type of the last error for adaptive cooldowns
     # Values: 'RATE_LIMIT', 'QUOTA_EXCEEDED', or None
@@ -52,8 +51,8 @@ class GlobalState:
     IS_RECOVERING = False
     # Flag to indicate if the system is in emergency operation mode (e.g. all profiles exhausted)
     DEPLOYMENT_EMERGENCY_MODE = False
-    # Event to signal that recovery is complete and streams can resume
-    RECOVERY_EVENT = asyncio.Event()
+    # 用于通知恢复完成、可恢复流的全局事件
+    RECOVERY_EVENT: Optional[asyncio.Event] = None
     # [FIX-RACE] Track last rotation timestamp to handle race conditions
     LAST_ROTATION_TIMESTAMP = 0.0
 
@@ -92,9 +91,13 @@ class GlobalState:
 
     @classmethod
     def init_rotation_lock(cls):
-        """Initialize the rotation lock to allow requests."""
+        """初始化异步事件，绑定到当前运行的事件循环"""
+        cls.AUTH_ROTATION_LOCK = asyncio.Event()
         cls.AUTH_ROTATION_LOCK.set()
-        logger.info("🔐 Global Auth Rotation Lock initialized (OPEN).")
+        cls.QUOTA_EXCEEDED_EVENT = asyncio.Event()
+        cls.rotation_complete_event = asyncio.Event()
+        cls.RECOVERY_EVENT = asyncio.Event()
+        logger.info("🔐 全局轮转锁及相关事件已绑定当前事件循环并初始化成功")
 
     @classmethod
     def set_quota_exceeded(cls, message: str = "", model_id: Optional[str] = None):
@@ -106,7 +109,14 @@ class GlobalState:
         if not cls.IS_QUOTA_EXCEEDED:
             cls.IS_QUOTA_EXCEEDED = True
             cls.QUOTA_EXCEEDED_TIMESTAMP = time.time()
-            cls.QUOTA_EXCEEDED_EVENT.set()
+            # Guard: in subprocess (e.g. stream proxy) the event may not be initialized.
+            # Calling .set() on None previously crashed jserror parsing.
+            if cls.QUOTA_EXCEEDED_EVENT is not None:
+                cls.QUOTA_EXCEEDED_EVENT.set()
+            else:
+                logger.debug(
+                    "QUOTA_EXCEEDED_EVENT is None (likely in subprocess); skipping .set()."
+                )
 
             # Determine error type
             safe_message = message if message else ""
@@ -150,7 +160,9 @@ class GlobalState:
         cls.NEEDS_ROTATION = False  # Reset soft flag too
         cls.QUOTA_EXCEEDED_TIMESTAMP = 0.0
         cls.last_error_type = None
-        cls.QUOTA_EXCEEDED_EVENT.clear()
+        # Guard: events may be None if init_rotation_lock() hasn't run (e.g. in tests/subprocess)
+        if cls.QUOTA_EXCEEDED_EVENT is not None:
+            cls.QUOTA_EXCEEDED_EVENT.clear()
 
         # [QUOTA-02] Reset model usage stats
         cls.current_profile_model_usage.clear()

@@ -79,9 +79,12 @@ def _initialize_globals():
 def _initialize_proxy_settings():
     stream_port_env = get_environment_variable("STREAM_PORT")
     if stream_port_env == "0":
-        proxy_server_url = get_environment_variable(
-            "HTTPS_PROXY"
-        ) or get_environment_variable("HTTP_PROXY")
+        # 关闭本地流代理时，浏览器仍可直接使用统一上游代理。
+        proxy_server_url = (
+            get_environment_variable("UNIFIED_PROXY_CONFIG")
+            or get_environment_variable("HTTPS_PROXY")
+            or get_environment_variable("HTTP_PROXY")
+        )
     else:
         proxy_server_url = f"http://127.0.0.1:{stream_port_env or 3120}/"
 

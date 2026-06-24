@@ -1,3 +1,6 @@
+from __future__ import annotations
+# 启用类型注解延迟评估以兼容 Python 3.9
+
 """
 Static files serving routes
 Uses FastAPI/Starlette native static files service

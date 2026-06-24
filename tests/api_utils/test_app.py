@@ -267,13 +267,14 @@ def test_initialize_proxy_settings_no_port():
     ):
         mock_get_env.side_effect = lambda key, default=None: {
             "STREAM_PORT": "0",
+            "UNIFIED_PROXY_CONFIG": "http://unified-proxy:7897",
             "HTTPS_PROXY": "http://system-proxy:8080",
         }.get(key, default)
 
         _initialize_proxy_settings()
 
         assert state.PLAYWRIGHT_PROXY_SETTINGS == {
-            "server": "http://system-proxy:8080",
+            "server": "http://unified-proxy:7897",
             "bypass": "127.0.0.1",
         }
 

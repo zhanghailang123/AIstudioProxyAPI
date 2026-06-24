@@ -67,6 +67,7 @@ async def test_handle_client_exception(proxy_server):
 async def test_handle_connect_no_transport(proxy_server, mock_deps):
     """Test CONNECT when transport is None."""
     mock_reader = AsyncMock()
+    mock_reader.readline = AsyncMock(return_value=b"\r\n")
     mock_writer = MagicMock()
     mock_writer.drain = AsyncMock()  # Fix: drain must be awaitable
 
@@ -88,6 +89,7 @@ async def test_handle_connect_no_transport(proxy_server, mock_deps):
 async def test_handle_connect_start_tls_fail(proxy_server, mock_deps):
     """Test CONNECT when start_tls returns None."""
     mock_reader = AsyncMock()
+    mock_reader.readline = AsyncMock(return_value=b"\r\n")
     mock_writer = MagicMock()
     mock_writer.drain = AsyncMock()  # Fix: drain must be awaitable
 
@@ -256,6 +258,7 @@ async def test_handle_connect_connection_error_with_interception(
     2. Close the client writer properly
     """
     mock_reader = AsyncMock()
+    mock_reader.readline = AsyncMock(return_value=b"\r\n")
     mock_writer = MagicMock()
     mock_writer.drain = AsyncMock()
     mock_writer.close = MagicMock()
@@ -298,6 +301,7 @@ async def test_handle_connect_connection_error_no_interception(proxy_server, moc
     2. Close the original writer properly
     """
     mock_reader = AsyncMock()
+    mock_reader.readline = AsyncMock(return_value=b"\r\n")
     mock_writer = MagicMock()
     mock_writer.drain = AsyncMock()
     mock_writer.close = MagicMock()

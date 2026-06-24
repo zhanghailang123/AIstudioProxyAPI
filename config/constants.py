@@ -40,6 +40,11 @@ DEFAULT_THINKING_LEVEL_FLASH = (
 
 ENABLE_GOOGLE_SEARCH = os.environ.get('ENABLE_GOOGLE_SEARCH', 'false').lower() in ('true', '1', 'yes')
 
+# Whether to include reasoning/thinking content in the OpenAI-compatible API output
+# When True (default): reasoning_content is concatenated with body content in non-streaming responses
+# When False: reasoning_content is excluded from the content field, only final answer is returned
+INCLUDE_REASONING_IN_OPENAI_OUTPUT = os.environ.get('INCLUDE_REASONING_IN_OPENAI_OUTPUT', 'true').lower() in ('true', '1', 'yes')
+
 # Default Stop Sequences - Support JSON format configuration
 try:
     DEFAULT_STOP_SEQUENCES = json.loads(os.environ.get('DEFAULT_STOP_SEQUENCES', '["User:"]'))

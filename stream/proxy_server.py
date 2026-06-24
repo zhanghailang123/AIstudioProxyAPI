@@ -33,6 +33,17 @@ class ProxyServer:
             "play.google.com",
             "apis.google.com",
             "accounts.google.com",
+            # Bypass MITM for ALL AI Studio / GenerateContent hosts to preserve the
+            # browser TLS fingerprint. Python's ssl.create_default_context() produces a
+            # JA3/JA4 fingerprint that Google's bot detection identifies as non-browser,
+            # causing 403 "permission denied" on GenerateContent requests.
+            #
+            # aistudio.google.com is the PRIMARY host: AI Studio sends GenerateContent
+            # via BatchExecute RPC to this domain (not to alkalimakersuite-pa). Without
+            # passthrough here, every API call uses Python's TLS fingerprint → 403.
+            "aistudio.google.com",
+            "alkalimakersuite-pa.clients6.google.com",
+            "clients6.google.com",
         ]
         self.upstream_proxy = upstream_proxy
         self.queue = queue
@@ -137,13 +148,30 @@ class ProxyServer:
         port = int(port_str)
         intercept = self.should_intercept(host)
 
+        # Drain any remaining CONNECT request headers (handle_client only
+        # consumed the request line via readline()). We must consume up to and
+        # including the terminating empty line BEFORE responding with 200.
+        # IMPORTANT: do NOT use reader.read(N) here. read(N) returns whatever
+        # is currently buffered, which races with the client's TLS ClientHello
+        # arriving immediately after our 200 response. In headless/fast paths
+        # this race causes the ClientHello to be silently swallowed, breaking
+        # the upstream TLS handshake and producing 403 "permission denied"
+        # from Google for aistudio.google.com (passthrough) and intermittent
+        # failures for intercepted hosts.
+        try:
+            while True:
+                header_line = await reader.readline()
+                if not header_line or header_line in (b"\r\n", b"\n"):
+                    break
+        except Exception:
+            # Best-effort drain; continue regardless of malformed headers.
+            pass
+
         if intercept:
             self.cert_manager.get_domain_cert(host)
 
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
-
-            await reader.read(8192)
 
             loop = asyncio.get_running_loop()
             transport = writer.transport
@@ -209,8 +237,6 @@ class ProxyServer:
         else:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
-
-            await reader.read(8192)
 
             try:
                 (
@@ -314,7 +340,16 @@ class ProxyServer:
                             client_buffer.clear()
                             continue
 
-                        if "GenerateContent" in path or "generateContent" in path:
+                        # Only sniff actual GenerateContent API requests.
+                        # jserror reporting URLs contain "GenerateContent" in the query
+                        # string (e.g. /_/MakerSuite/jserror?...&error=...GenerateContent...)
+                        # which would falsely trigger sniffing and put error payloads in
+                        # the stream queue from unrelated jserror responses.
+                        path_no_query = path.split("?")[0]
+                        if (
+                            "GenerateContent" in path_no_query
+                            or "generateContent" in path_no_query
+                        ) and "jserror" not in path:
                             should_sniff = True
                             request_context["request_ts"] = time.time()
                             # Reset interceptor state for new request to prevent

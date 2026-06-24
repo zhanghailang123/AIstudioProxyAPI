@@ -1,4 +1,5 @@
 import asyncio
+import random
 from typing import Callable, List
 
 from playwright.async_api import TimeoutError
@@ -51,17 +52,94 @@ class InputController(BaseController):
                 check_client_disconnected, "After Input Visible"
             )
 
-            # Fill text using JavaScript
-            await prompt_textarea_locator.evaluate(
-                """
-                (element, text) => {
-                    element.value = text;
-                    element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                    element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                }
-                """,
-                prompt,
-            )
+            # --- Input method: keyboard.type() with random delays ---
+            #
+            # CRITICAL ANTI-DETECTION MEASURE:
+            #
+            # Playwright's fill() uses CDP's Input.insertText, which:
+            #   - Does NOT generate keydown/keypress/keyup events
+            #   - Is a single atomic operation visible to the browser engine
+            #   - Can be detected by Google's AI Studio frontend JavaScript
+            #
+            # page.keyboard.type() uses CDP's Input.dispatchKeyEvent for
+            # each character, generating the FULL keyboard event chain
+            # (keydown → keypress → input → keyup).  Combined with random
+            # inter-character delays, this closely mimics real user input
+            # and is much harder for anti-automation systems to detect.
+            #
+            # The previous JS evaluate() approach (element.value = text) was
+            # abandoned because it bypasses Angular's reactive form value
+            # accessor, leaving the form state stale.  keyboard.type()
+            # properly updates the Angular form state via native input events.
+            try:
+                # Focus the textarea first (required before keyboard.type)
+                await prompt_textarea_locator.click(timeout=5000)
+                await asyncio.sleep(0.2)
+
+                # Type character by character with random delays.
+                # delay range 15-45ms ≈ ~30-90 WPM, fast human typing.
+                # For a 200-char prompt: 15*200=3s to 45*200=9s.
+                await self.page.keyboard.type(
+                    prompt,
+                    delay=random.randint(15, 45),
+                )
+
+                # Give Angular's reactive forms time to process the final
+                # input event dispatched by the last keystroke.
+                await asyncio.sleep(0.5)
+
+                # Dispatch blur and re-focus to trigger Angular's form
+                # validation and ensure the ControlValueAccessor has
+                # committed the value.
+                await prompt_textarea_locator.evaluate(
+                    """
+                    (element) => {
+                        element.blur();
+                        element.focus();
+                    }
+                    """
+                )
+                self.logger.debug(
+                    f"[Input] Typed {len(prompt)} chars via keyboard.type()"
+                )
+            except Exception as type_err:
+                # Fallback: Playwright fill() if keyboard.type() fails
+                # (e.g. element lost focus or page navigated away).
+                self.logger.debug(
+                    f"[Input] keyboard.type() failed ({type_err}), "
+                    f"falling back to fill()."
+                )
+                try:
+                    await prompt_textarea_locator.fill(prompt, timeout=10000)
+                    await asyncio.sleep(0.5)
+                    await prompt_textarea_locator.evaluate(
+                        """
+                        (element) => {
+                            element.blur();
+                            element.focus();
+                        }
+                        """
+                    )
+                except Exception as fill_err:
+                    # Last resort: JS evaluate with native events
+                    self.logger.debug(
+                        f"[Input] fill() also failed ({fill_err}), "
+                        f"falling back to JS evaluate."
+                    )
+                    await prompt_textarea_locator.evaluate(
+                        """
+                        (element, text) => {
+                            element.focus();
+                            element.value = text;
+                            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                            element.blur();
+                            element.focus();
+                        }
+                        """,
+                        prompt,
+                    )
+                    await asyncio.sleep(0.5)
             autosize_target = autosize_wrapper_locator
             if await autosize_target.count() == 0:
                 autosize_target = legacy_autosize_wrapper
@@ -130,55 +208,36 @@ class InputController(BaseController):
             )
             await asyncio.sleep(0.3)
 
-            # Try clicking button first, then Enter, then Combo keys
-            button_clicked = False
-            try:
-                self.logger.debug("[Input] Attempting to click submit button...")
-                # Handle potential dialogs before submit
-                await self._handle_post_upload_dialog()
-                # Try to clear tooltip overlays
-                await self._dismiss_tooltip_overlays()
-                try:
-                    await submit_button_locator.click(timeout=5000)
-                except Exception:
-                    # If normal click fails (possibly blocked by tooltip), use JavaScript click
-                    self.logger.debug(
-                        "[Input] Normal click failed, attempting JavaScript click..."
-                    )
-                    js_clicked = await self._js_click_submit_button(
-                        submit_button_locator
-                    )
-                    if not js_clicked:
-                        # Finally try force click
-                        self.logger.debug(
-                            "[Input] JavaScript click failed, attempting force click..."
-                        )
-                        await submit_button_locator.click(timeout=5000, force=True)
-                self.logger.debug("[Input] Submit button click complete")
-                button_clicked = True
-            except Exception as click_err:
-                self.logger.error(f"Submit button click failed: {click_err}")
-                await save_error_snapshot(f"submit_button_click_fail_{self.req_id}")
-
-            if not button_clicked:
+            # 优先使用页面提示的官方快捷键，减少按钮点击带来的自动化特征。
+            submitted_successfully = await self._try_combo_submit(
+                prompt_textarea_locator, check_client_disconnected
+            )
+            if not submitted_successfully:
                 self.logger.info(
-                    "Button submit failed, attempting Enter key submission..."
+                    "Combo submission failed, attempting Enter key submission..."
                 )
                 submitted_successfully = await self._try_enter_submit(
                     prompt_textarea_locator, check_client_disconnected
                 )
-                if not submitted_successfully:
-                    self.logger.info(
-                        "Enter submission failed, attempting combo key submission..."
+
+            if not submitted_successfully:
+                try:
+                    self.logger.debug("[Input] Attempting button submit fallback...")
+                    await self._handle_post_upload_dialog()
+                    await self._dismiss_tooltip_overlays()
+                    await submit_button_locator.click(timeout=5000)
+                    self.logger.debug("[Input] Submit button fallback complete")
+                    submitted_successfully = True
+                except Exception as click_err:
+                    self.logger.error(f"Submit button fallback failed: {click_err}")
+                    await save_error_snapshot(
+                        f"submit_button_click_fail_{self.req_id}"
                     )
-                    combo_ok = await self._try_combo_submit(
-                        prompt_textarea_locator, check_client_disconnected
-                    )
-                    if not combo_ok:
-                        self.logger.error("Combo key submission also failed.")
-                        raise Exception(
-                            "Submit failed: Button, Enter, and Combo key all failed"
-                        )
+
+            if not submitted_successfully:
+                raise Exception(
+                    "Submit failed: Combo key, Enter, and Button all failed"
+                )
 
             await self._check_disconnect(check_client_disconnected, "After Submit")
 
@@ -388,6 +447,14 @@ class InputController(BaseController):
                             count++;
                         });
                     }
+                    // Neutralise transparent CDK overlay backdrops that
+                    // intercept clicks without being visible.
+                    document.querySelectorAll(
+                        'div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop'
+                    ).forEach(el => {
+                        el.style.pointerEvents = 'none';
+                        count++;
+                    });
                     return count;
                 }
             """)
@@ -538,7 +605,8 @@ class InputController(BaseController):
                         user_agent_data_platform = "macOS"
                     else:
                         user_agent_data_platform = "Other"
-                is_mac_determined = "mac" in user_agent_data_platform.lower()
+                # 平台值可能为空或被测试 mock 成非字符串，统一转字符串判断。
+                is_mac_determined = "mac" in str(user_agent_data_platform).lower()
 
             shortcut_modifier = "Meta" if is_mac_determined else "Control"
             shortcut_key = "Enter"

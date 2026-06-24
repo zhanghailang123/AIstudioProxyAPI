@@ -3,7 +3,8 @@ Tests for browser_utils/initialization/debug.py
 Target coverage: >80% (from baseline 10%)
 """
 
-from unittest.mock import Mock, PropertyMock, patch
+import asyncio
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import pytest
 
@@ -220,6 +221,72 @@ def test_response_handler_error_status(mock_page, mock_state_with_logs):
 
     assert len(mock_state_with_logs.network_log["responses"]) == 1
     assert mock_state_with_logs.network_log["responses"][0]["status"] == 404
+
+
+@pytest.mark.asyncio
+async def test_ai_studio_error_response_body_preview(mock_page, mock_state_with_logs):
+    """AI Studio 生成错误响应应记录截断后的错误体，便于定位上游原因。"""
+    setup_debug_listeners(mock_page)
+
+    response_handler = None
+    for call_args in mock_page.on.call_args_list:
+        if call_args[0][0] == "response":
+            response_handler = call_args[0][1]
+            break
+
+    error_resp = Mock()
+    error_resp.url = (
+        "https://aistudio.google.com/_/MakerSuiteUi/data/batchexecute"
+        "?rpcids=GenerateContent"
+    )
+    error_resp.status = 403
+    error_resp.status_text = "Forbidden"
+    error_resp.text = AsyncMock(
+        return_value="prefix Failed to generate content: permission denied. Please try again."
+    )
+
+    assert response_handler is not None
+    with patch("browser_utils.initialization.debug.logger") as mock_logger:
+        response_handler(error_resp)
+        await asyncio.sleep(0)
+
+    response_entry = mock_state_with_logs.network_log["responses"][0]
+    assert response_entry["status"] == 403
+    assert "permission denied" in response_entry["body_preview"].lower()
+    assert "permission denied" in response_entry["error_markers"]
+    assert mock_logger.warning.called
+
+
+@pytest.mark.asyncio
+async def test_ai_studio_permission_rpc_body_marker(mock_page, mock_state_with_logs):
+    """gRPC status 7 权限拒绝响应应标记为 permission 类错误。"""
+    setup_debug_listeners(mock_page)
+
+    response_handler = None
+    for call_args in mock_page.on.call_args_list:
+        if call_args[0][0] == "response":
+            response_handler = call_args[0][1]
+            break
+
+    error_resp = Mock()
+    error_resp.url = (
+        "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+        "google.internal.alkali.applications.makersuite.v1."
+        "MakerSuiteService/GenerateContent"
+    )
+    error_resp.status = 403
+    error_resp.status_text = "Forbidden"
+    error_resp.text = AsyncMock(
+        return_value='[,[7,"The caller does not have permission"]]'
+    )
+
+    assert response_handler is not None
+    response_handler(error_resp)
+    await asyncio.sleep(0)
+
+    response_entry = mock_state_with_logs.network_log["responses"][0]
+    assert "caller does not have permission" in response_entry["body_preview"].lower()
+    assert "caller does not have permission" in response_entry["error_markers"]
 
 
 def test_console_handler_exception_caught(mock_page, mock_state_with_logs):

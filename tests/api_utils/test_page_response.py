@@ -19,7 +19,11 @@ from fastapi import HTTPException
 from playwright.async_api import Error as PlaywrightAsyncError
 
 from api_utils.page_response import locate_response_elements
-from models.exceptions import ClientDisconnectedError
+from models.exceptions import (
+    AIStudioPermissionDeniedError,
+    ClientDisconnectedError,
+    UpstreamError,
+)
 
 
 @pytest.fixture
@@ -27,6 +31,7 @@ def mock_page_response_setup():
     """Fixture providing common mocks for page_response tests."""
     logger = MagicMock()
     page = MagicMock()
+    page.evaluate = AsyncMock(return_value="")
     check_client_disconnected = MagicMock()
 
     # Mock locator chain: page.locator().last.locator()
@@ -117,10 +122,11 @@ class TestLocateResponseElementsSuccess:
                 setup["check_disconnect"],
             )
 
-            # Verify check_client_disconnected called (line 22)
-            setup["check_disconnect"].assert_called_once_with(
+            # 容器附着后检查一次，等待响应元素轮询时还会继续检查。
+            setup["check_disconnect"].assert_any_call(
                 "After Response Container Attached: "
             )
+            setup["check_disconnect"].assert_any_call("Waiting for Response Element: ")
 
     @pytest.mark.asyncio
     async def test_success_waits_for_both_container_and_element(
@@ -195,7 +201,7 @@ class TestLocateResponseElementsSuccess:
             # Verify timeout parameters
             calls = mock_expect_result.to_be_attached.call_args_list
             assert calls[0][1]["timeout"] == 20000  # Container timeout
-            assert calls[1][1]["timeout"] == 90000  # Element timeout
+            assert calls[1][1]["timeout"] == 1000  # Element poll timeout
 
 
 class TestLocateResponseElementsTimeouts:
@@ -207,7 +213,13 @@ class TestLocateResponseElementsTimeouts:
         setup = mock_page_response_setup
 
         # Mock expect_async to raise PlaywrightAsyncError on first call
-        with patch("api_utils.page_response.expect_async") as mock_expect:
+        with (
+            patch("api_utils.page_response.expect_async") as mock_expect,
+            patch(
+                "api_utils.page_response.time.monotonic",
+                side_effect=[0.0, 91.0],
+            ),
+        ):
             mock_expect_result = AsyncMock()
             mock_expect_result.to_be_attached = AsyncMock(
                 side_effect=PlaywrightAsyncError("Timeout 20000ms exceeded")
@@ -235,7 +247,13 @@ class TestLocateResponseElementsTimeouts:
         setup = mock_page_response_setup
 
         # Mock expect_async: succeed on first call (container), fail on second (element)
-        with patch("api_utils.page_response.expect_async") as mock_expect:
+        with (
+            patch("api_utils.page_response.expect_async") as mock_expect,
+            patch(
+                "api_utils.page_response.time.monotonic",
+                side_effect=[0.0, 91.0],
+            ),
+        ):
             mock_expect_result_container = AsyncMock()
             mock_expect_result_container.to_be_attached = AsyncMock()
 
@@ -299,6 +317,85 @@ class TestLocateResponseElementsTimeouts:
 
 class TestLocateResponseElementsErrors:
     """Tests for error handling (client disconnect, generic errors)."""
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_page_error_raises_permission_error(
+        self, mock_page_response_setup
+    ):
+        """页面权限错误应立即分类，不应包装成普通 500。"""
+        setup = mock_page_response_setup
+        setup["page"].evaluate = AsyncMock(
+            return_value="Failed to generate content: permission denied. Please try again."
+        )
+
+        with patch("api_utils.page_response.expect_async") as mock_expect:
+            container_expect = AsyncMock()
+            container_expect.to_be_attached = AsyncMock()
+            element_expect = AsyncMock()
+            element_expect.to_be_attached = AsyncMock(
+                side_effect=PlaywrightAsyncError("not attached yet")
+            )
+            mock_expect.side_effect = [container_expect, element_expect]
+
+            with pytest.raises(AIStudioPermissionDeniedError) as exc_info:
+                await locate_response_elements(
+                    setup["page"],
+                    "req1",
+                    setup["logger"],
+                    setup["check_disconnect"],
+                )
+
+            assert "permission denied" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_caller_permission_page_error_raises_permission_error(
+        self, mock_page_response_setup
+    ):
+        """上游 caller permission 文案也应归类为权限拒绝。"""
+        setup = mock_page_response_setup
+        setup["page"].evaluate = AsyncMock(
+            return_value='[,[7,"The caller does not have permission"]]'
+        )
+
+        with patch("api_utils.page_response.expect_async") as mock_expect:
+            container_expect = AsyncMock()
+            container_expect.to_be_attached = AsyncMock()
+            mock_expect.return_value = container_expect
+
+            with pytest.raises(AIStudioPermissionDeniedError) as exc_info:
+                await locate_response_elements(
+                    setup["page"],
+                    "req1",
+                    setup["logger"],
+                    setup["check_disconnect"],
+                )
+
+            assert "caller does not have permission" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_internal_page_error_raises_upstream_error(
+        self, mock_page_response_setup
+    ):
+        """页面内部错误应立即暴露为上游错误，不等待响应节点超时。"""
+        setup = mock_page_response_setup
+        setup["page"].evaluate = AsyncMock(
+            return_value="Model\nAn internal error has occurred."
+        )
+
+        with patch("api_utils.page_response.expect_async") as mock_expect:
+            container_expect = AsyncMock()
+            container_expect.to_be_attached = AsyncMock()
+            mock_expect.return_value = container_expect
+
+            with pytest.raises(UpstreamError) as exc_info:
+                await locate_response_elements(
+                    setup["page"],
+                    "req1",
+                    setup["logger"],
+                    setup["check_disconnect"],
+                )
+
+            assert "internal error" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_client_disconnect_raises_http_500(self, mock_page_response_setup):

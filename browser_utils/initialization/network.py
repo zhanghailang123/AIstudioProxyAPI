@@ -2,12 +2,13 @@
 import asyncio
 import json
 import logging
+import re
 
 from playwright.async_api import BrowserContext as AsyncBrowserContext
 
 from config import settings
 
-from .scripts import add_init_scripts_to_context
+from .scripts import add_anti_automation_script, add_init_scripts_to_context
 
 logger = logging.getLogger("AIStudioProxyServer")
 
@@ -15,6 +16,13 @@ logger = logging.getLogger("AIStudioProxyServer")
 async def setup_network_interception_and_scripts(context: AsyncBrowserContext):
     """Setup network interception and script injection"""
     try:
+        # ── Anti-automation-detection (ALWAYS enabled) ──────────────────────
+        # Playwright's CDP connection sets navigator.webdriver=true and adds
+        # other detectable fingerprints. Google's AI Studio frontend checks
+        # these and returns 403 "permission denied" on GenerateContent when
+        # automation is detected. This script patches those fingerprints.
+        await add_anti_automation_script(context)
+
         # Check for network interception toggle
         if settings.NETWORK_INTERCEPTION_ENABLED:
             # Setup network interception
@@ -64,9 +72,25 @@ async def _setup_model_list_interception(context: AsyncBrowserContext):
                 # For other requests, continue normally
                 await route.continue_()
 
-        # Register route interceptor
-        await context.route("**/*", handle_model_list_route)
-        logger.info("Model list network interception setup")
+        # Register route interceptor — ONLY for ListModels requests.
+        #
+        # CRITICAL: The previous pattern "**/*" intercepted EVERY browser request
+        # via Playwright's DevTools Protocol.  Even though route.continue_() was
+        # called for non-ListModels requests, the pause-resume cycle introduced
+        # by Playwright breaks the MITM proxy's TLS-fingerprint passthrough for
+        # GenerateContent requests.  The browser's native TLS ClientHello never
+        # reaches the passthrough tunnel intact, so Google sees a non-browser
+        # (or inconsistent) TLS fingerprint and returns 403 "permission denied".
+        #
+        # By narrowing the pattern to only match ListModels URLs, GenerateContent
+        # and all other requests flow through the browser's native networking
+        # stack → MITM proxy passthrough → upstream proxy → Google, preserving
+        # the Camoufox TLS fingerprint that manual browsing uses.
+        await context.route(
+            re.compile(r"alkalimakersuite.*ListModels"),
+            handle_model_list_route,
+        )
+        logger.info("Model list network interception setup (ListModels-only pattern)")
 
     except asyncio.CancelledError:
         raise

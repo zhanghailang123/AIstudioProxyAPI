@@ -11,6 +11,7 @@ from browser_utils.initialization import (
     enable_temporary_chat_mode,
     signal_camoufox_shutdown,
 )
+from browser_utils.initialization.core import _wait_for_shutdown
 
 # --- Existing Tests (Preserved) ---
 
@@ -176,6 +177,93 @@ async def test_initialize_page_logic_proxy_settings(
         call_args = mock_browser.new_context.call_args
         assert call_args is not None
         assert call_args[1]["proxy"] == {"server": "http://proxy:8080"}
+
+
+@pytest.mark.asyncio
+async def test_initialize_page_logic_reuses_existing_ai_studio_page(
+    mock_browser,
+    mock_browser_context,
+    mock_page,
+    mock_expect,
+    mock_server_state,
+):
+    with (
+        patch.dict(
+            os.environ,
+            {"LAUNCH_MODE": "debug", "REUSE_EXISTING_AISTUDIO_PAGE": "true"},
+        ),
+        patch(
+            "browser_utils.initialization.core.setup_network_interception_and_scripts",
+            new_callable=AsyncMock,
+        ) as mock_setup,
+        patch("browser_utils.initialization.core.setup_debug_listeners"),
+    ):
+        mock_browser_context.pages = [mock_page]
+        mock_browser.contexts = [mock_browser_context]
+        mock_page.url = "https://aistudio.google.com/prompts/new_chat"
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_page.locator.return_value.first.inner_text = AsyncMock(
+            return_value="Gemini 1.5 Pro"
+        )
+
+        page, ready = await _initialize_page_logic(mock_browser)
+
+        assert page == mock_page
+        assert ready is True
+        mock_browser.new_context.assert_not_called()
+        mock_browser_context.new_page.assert_not_called()
+        mock_setup.assert_awaited_once_with(mock_browser_context)
+        assert mock_server_state.current_auth_profile_path is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_page_logic_reuse_disabled_ignores_browser_contexts(
+    mock_browser,
+    mock_browser_context,
+    mock_page,
+    mock_expect,
+    mock_server_state,
+):
+    with (
+        patch.dict(
+            os.environ,
+            {"LAUNCH_MODE": "debug", "REUSE_EXISTING_AISTUDIO_PAGE": "false"},
+        ),
+        patch(
+            "browser_utils.initialization.core.setup_network_interception_and_scripts",
+            new_callable=AsyncMock,
+        ),
+        patch("browser_utils.initialization.core.setup_debug_listeners"),
+    ):
+        existing_page = AsyncMock()
+        existing_page.url = "https://aistudio.google.com/prompts/new_chat"
+        existing_page.is_closed = MagicMock(return_value=False)
+        mock_browser.contexts = [AsyncMock(pages=[existing_page])]
+
+        mock_browser_context.pages = []
+        mock_browser_context.new_page.return_value = mock_page
+        mock_page.url = "https://aistudio.google.com/prompts/new_chat"
+        mock_page.locator.return_value.first.inner_text = AsyncMock(
+            return_value="Gemini 1.5 Pro"
+        )
+
+        page, ready = await _initialize_page_logic(mock_browser)
+
+        assert page == mock_page
+        assert ready is True
+        mock_browser.new_context.assert_called_once()
+        mock_browser_context.new_page.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_shutdown_task_is_cancellable():
+    task = asyncio.create_task(_wait_for_shutdown())
+    await asyncio.sleep(0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 # --- New Tests ---
@@ -871,59 +959,93 @@ async def test_signal_camoufox_shutdown_exception(mock_server_state):
 # 8. Enable Temporary Chat Mode
 
 
+def _make_temp_chat_locator(classes: str = "", count: int = 1):
+    locator = MagicMock()
+    locator.count = AsyncMock(return_value=count)
+    locator.wait_for = AsyncMock()
+    locator.click = AsyncMock()
+    locator.is_visible = AsyncMock(return_value=True)
+    locator.get_attribute = AsyncMock(
+        side_effect=lambda name: classes if name == "class" else None
+    )
+    return locator
+
+
+def _configure_temp_chat_page(mock_page, temp_locator):
+    empty_locator = _make_temp_chat_locator(count=0)
+    menu_locator = _make_temp_chat_locator(count=0)
+
+    def locator_factory(selector):
+        selector_text = str(selector)
+        if "ms-incognito-mode-indicator" in selector_text:
+            return empty_locator
+        if "data-test-incognito-checkmark" in selector_text:
+            return empty_locator
+        if "data-test-incognito-toggle" in selector_text:
+            return temp_locator
+        if "View more actions" in selector_text:
+            return menu_locator
+        return empty_locator
+
+    mock_page.locator = MagicMock(side_effect=locator_factory)
+    return menu_locator
+
+
 @pytest.mark.asyncio
 async def test_enable_temporary_chat_mode_already_active(mock_page):
-    locator = MagicMock()
-    locator.wait_for = AsyncMock()
-    locator.get_attribute = AsyncMock(return_value="ms-button-active")
-    mock_page.locator.return_value = locator
+    locator = _make_temp_chat_locator(classes="ms-button-active")
+    _configure_temp_chat_page(mock_page, locator)
 
-    await enable_temporary_chat_mode(mock_page)
+    with patch.dict(os.environ, {"ENABLE_TEMPORARY_CHAT": "true"}):
+        await enable_temporary_chat_mode(mock_page)
 
     locator.click.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_enable_temporary_chat_mode_activate_success(mock_page):
-    locator = MagicMock()
-    locator.wait_for = AsyncMock()
-    locator.click = AsyncMock()
+    locator = _make_temp_chat_locator()
     # First inactive, then active
-    locator.get_attribute = AsyncMock(side_effect=["", "ms-button-active"])
-    # Use side_effect to override the factory
-    mock_page.locator = MagicMock(return_value=locator)
+    locator.get_attribute = AsyncMock(
+        side_effect=lambda name: "" if locator.click.await_count == 0 else "ms-button-active"
+    )
+    _configure_temp_chat_page(mock_page, locator)
 
-    await enable_temporary_chat_mode(mock_page)
+    with patch.dict(os.environ, {"ENABLE_TEMPORARY_CHAT": "true"}):
+        await enable_temporary_chat_mode(mock_page)
 
     locator.click.assert_called()
 
 
 @pytest.mark.asyncio
 async def test_enable_temporary_chat_mode_activate_fail(mock_page):
-    locator = MagicMock()
-    locator.wait_for = AsyncMock()
-    locator.click = AsyncMock()
+    locator = _make_temp_chat_locator()
     # Always inactive
     locator.get_attribute = AsyncMock(return_value="")
-    # Use side_effect to override the factory
-    mock_page.locator = MagicMock(return_value=locator)
+    _configure_temp_chat_page(mock_page, locator)
 
-    await enable_temporary_chat_mode(mock_page)
+    with patch.dict(os.environ, {"ENABLE_TEMPORARY_CHAT": "true"}):
+        await enable_temporary_chat_mode(mock_page)
 
     locator.click.assert_called()
 
 
 @pytest.mark.asyncio
 async def test_enable_temporary_chat_mode_exception(mock_page):
-    mock_page.locator.side_effect = Exception("Locator Fail")
+    locator = _make_temp_chat_locator()
+    locator.wait_for.side_effect = Exception("Locator Fail")
+    _configure_temp_chat_page(mock_page, locator)
 
     # Should catch exception and log warning
-    await enable_temporary_chat_mode(mock_page)
+    with patch.dict(os.environ, {"ENABLE_TEMPORARY_CHAT": "true"}):
+        await enable_temporary_chat_mode(mock_page)
 
 
 @pytest.mark.asyncio
 async def test_enable_temporary_chat_mode_cancelled(mock_page):
     mock_page.locator.side_effect = asyncio.CancelledError()
 
-    with pytest.raises(asyncio.CancelledError):
+    with patch.dict(os.environ, {"ENABLE_TEMPORARY_CHAT": "true"}), pytest.raises(
+        asyncio.CancelledError
+    ):
         await enable_temporary_chat_mode(mock_page)

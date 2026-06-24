@@ -372,14 +372,51 @@ class ThinkingController(BaseController):
         try:
             trigger = self.page.locator(THINKING_LEVEL_SELECT_SELECTOR)
             await expect_async(trigger).to_be_visible(timeout=5000)
+
+            # ── Early exit: check if current value already matches ──────────
+            # Avoids opening the dropdown and clicking an already-selected
+            # option, which can fail with Angular Material when overlays
+            # intercept the click.
+            try:
+                current_text = await trigger.locator(
+                    ".mat-mdc-select-value-text .mat-mdc-select-min-line"
+                ).inner_text(timeout=2000)
+                if current_text.strip().lower() == level.lower():
+                    self.logger.info(
+                        f"Thinking Level already set to {level}, skipping."
+                    )
+                    return
+            except Exception:
+                pass  # Can't read current value; proceed with setting it
+
             await trigger.scroll_into_view_if_needed()
+
+            # Dismiss any transparent overlays that could intercept the click
+            try:
+                await self.page.evaluate("""
+                    () => {
+                        document.querySelectorAll(
+                            'div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop'
+                        ).forEach(el => el.style.pointerEvents = 'none');
+                    }
+                """)
+            except Exception:
+                pass
+
             await trigger.click(timeout=CLICK_TIMEOUT_MS)
             await self._check_disconnect(
                 check_client_disconnected, "After opening Thinking Level"
             )
             option = self.page.locator(target_option_selector)
             await expect_async(option).to_be_visible(timeout=5000)
-            await option.click(timeout=CLICK_TIMEOUT_MS)
+            try:
+                await option.click(timeout=CLICK_TIMEOUT_MS)
+            except Exception:
+                # Fallback: JS click if normal click is blocked by overlay
+                self.logger.debug(
+                    "[Thinking] Normal click on level option failed, trying JS click"
+                )
+                await option.evaluate("el => el.click()")
             await asyncio.sleep(0.2)
             try:
                 await expect_async(

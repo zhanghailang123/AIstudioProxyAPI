@@ -13,7 +13,7 @@ from playwright.async_api import Locator
 from playwright.async_api import expect as expect_async
 
 from api_utils.context_types import QueueItem
-from models import QuotaExceededError
+from models import AIStudioPermissionDeniedError, QuotaExceededError
 
 from .client_connection import check_client_connection
 
@@ -85,6 +85,7 @@ async def queue_worker() -> None:
         client_disco_checker: Optional[Callable[[str], bool]] = None
         disconnect_monitor_task: Optional[Task] = None
         client_disconnected_early: bool = False
+        permission_denied_error: bool = False
 
         try:
             # [SHUTDOWN] Check shutdown signal
@@ -233,6 +234,8 @@ async def queue_worker() -> None:
             # Wait for lock
             async with processing_lock:
                 logger.info(f"[{req_id}] (Worker) Lock acquired.")
+                # 标记请求初始为失败状态
+                request_failed = True
 
                 if not await _test_client_connection(req_id, http_request):
                     if result_future and not result_future.done():
@@ -243,8 +246,19 @@ async def queue_worker() -> None:
                     logger.info(f"[{req_id}] (Worker) Future already done.")
                 else:
                     try:
-                        returned_value = await _process_request_refactored(
-                            req_id, request_data, http_request, result_future
+                        # Hard timeout safety net for the ENTIRE request lifecycle
+                        # (model switching + parameter adjustment + prompt submission
+                        # + response handling).  The previous 60s value only covered
+                        # prepare-and-submit; non-streaming requests block inside
+                        # _handle_auxiliary_stream_response waiting for the full
+                        # response, which can take up to RESPONSE_COMPLETION_TIMEOUT.
+                        # Using RESPONSE_COMPLETION_TIMEOUT/1000 + 60 matches the
+                        # post-processing wait_for below (lines ~312, ~343).
+                        returned_value = await asyncio.wait_for(
+                            _process_request_refactored(
+                                req_id, request_data, http_request, result_future
+                            ),
+                            timeout=RESPONSE_COMPLETION_TIMEOUT / 1000 + 60
                         )
 
                         if (
@@ -364,8 +378,23 @@ async def queue_worker() -> None:
                             except Exception:
                                 await save_error_snapshot(f"button_timeout_{req_id}")
 
+                        # 请求处理成功
+                        # Only mark as not-failed if quota is not exceeded.
+                        # The resilient stream generator catches QuotaExceededError
+                        # internally and returns normally even when rotation fails,
+                        # so we must check IS_QUOTA_EXCEEDED to avoid marking a
+                        # failed request as successful (which would skip the
+                        # forced page reload in cleanup, leaving the page stuck).
+                        if not GlobalState.IS_QUOTA_EXCEEDED:
+                            request_failed = False
+
                     except QuotaExceededError:
                         raise
+                    except AIStudioPermissionDeniedError as e:
+                        # AI Studio 权限拒绝是上游拒绝，不触发强刷和清理聊天。
+                        permission_denied_error = True
+                        request_failed = False
+                        logger.error(f"[{req_id}] (Worker) Permission denied: {e}")
                     except Exception as e:
                         logger.error(f"[{req_id}] (Worker) Error: {e}")
                         if result_future and not result_future.done():
@@ -383,59 +412,96 @@ async def queue_worker() -> None:
                             except asyncio.CancelledError:
                                 pass
 
-            # [ROTATION] Post-request rotation check
-            just_rotated = False
-            if GlobalState.NEEDS_ROTATION:
-                current_model_id_rot = state.current_ai_studio_model_id
-                if await perform_auth_rotation(
-                    target_model_id=current_model_id_rot or ""
-                ):
-                    GlobalState.NEEDS_ROTATION = False
-                    just_rotated = True
+                # --- 锁内清理逻辑：避免下一个请求提前进入导致弹窗冲突 ---
+                # [ROTATION] 请求后轮转检查
+                just_rotated = False
+                if GlobalState.NEEDS_ROTATION:
+                    current_model_id_rot = state.current_ai_studio_model_id
+                    if await perform_auth_rotation(
+                        target_model_id=current_model_id_rot or ""
+                    ):
+                        GlobalState.NEEDS_ROTATION = False
+                        just_rotated = True
 
-            # [CLEANUP]
-            try:
-                await clear_stream_queue()
+                # [CLEANUP] 清理与重置页面
+                try:
+                    await clear_stream_queue()
 
-                # [COOKIE-REFRESH] Save cookies after successful requests
-                if not client_disconnected_early and not GlobalState.IS_QUOTA_EXCEEDED:
-                    try:
-                        from browser_utils.cookie_refresh import (
-                            maybe_refresh_on_request,
-                        )
-
-                        await maybe_refresh_on_request()
-                    except Exception as cookie_err:
-                        logger.debug(
-                            f"[{req_id}] Cookie refresh error (non-critical): {cookie_err}"
-                        )
-
-                if (
-                    not GlobalState.IS_QUOTA_EXCEEDED
-                    and not just_rotated
-                    and not GlobalState.IS_SHUTTING_DOWN.is_set()
-                ):
-                    if submit_btn_loc and client_disco_checker:
-                        s_page = state.page_instance
-                        s_ready = state.is_page_ready
-                        s_browser = state.browser_instance
-
-                        if (
-                            s_page
-                            and s_ready
-                            and s_browser
-                            and s_browser.is_connected()
-                        ):
+                    # 如果请求处理失败，执行页面强制刷新兜底，防止浏览器状态卡死影响下一次请求
+                    if (
+                        request_failed
+                        and not permission_denied_error
+                        and state.page_instance
+                        and not state.page_instance.is_closed()
+                    ):
+                        try:
+                            logger.warning(f"[{req_id}] 请求处理失败，执行页面强制刷新兜底...")
                             try:
-                                controller = PageController(s_page, logger, req_id)
-                                await controller.clear_chat_history(lambda stage: False)
+                                # 尝试停止任何挂起的加载
+                                await state.page_instance.evaluate("window.stop()")
                             except Exception:
+                                pass
+                            await state.page_instance.reload(timeout=15000)
+                        except Exception as reload_err:
+                            logger.error(f"[{req_id}] 兜底页面刷新失败: {reload_err}")
+
+                    # [COOKIE-REFRESH] 请求成功后尝试刷新Cookie
+                    if not client_disconnected_early and not GlobalState.IS_QUOTA_EXCEEDED:
+                        try:
+                            from browser_utils.cookie_refresh import (
+                                maybe_refresh_on_request,
+                            )
+
+                            await maybe_refresh_on_request()
+                        except Exception as cookie_err:
+                            logger.debug(
+                                f"[{req_id}] Cookie refresh error (non-critical): {cookie_err}"
+                            )
+
+                    if (
+                        not GlobalState.IS_QUOTA_EXCEEDED
+                        and not permission_denied_error
+                        and not just_rotated
+                        and not GlobalState.IS_SHUTTING_DOWN.is_set()
+                    ):
+                        if submit_btn_loc and client_disco_checker:
+                            s_page = state.page_instance
+                            s_ready = state.is_page_ready
+                            s_browser = state.browser_instance
+
+                            if (
+                                s_page
+                                and s_ready
+                                and s_browser
+                                and s_browser.is_connected()
+                            ):
                                 try:
-                                    await s_page.reload()
+                                    controller = PageController(s_page, logger, req_id)
+                                    # Wrap with timeout to prevent indefinite hanging
+                                    # on pages in transitional/error states.
+                                    # The robust ChatController.clear_chat_history
+                                    # has its own internal timeouts, but
+                                    # enable_temporary_chat_mode() can hang on
+                                    # menu_trigger.click() which lacks a timeout.
+                                    await asyncio.wait_for(
+                                        controller.clear_chat_history(lambda stage: False),
+                                        timeout=30.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        f"[{req_id}] clear_chat_history timed out after 30s, reloading page"
+                                    )
+                                    try:
+                                        await s_page.reload(timeout=15000)
+                                    except Exception:
+                                        pass
                                 except Exception:
-                                    pass
-            except Exception as e:
-                logger.error(f"[{req_id}] Cleanup error: {e}")
+                                    try:
+                                        await s_page.reload()
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    logger.error(f"[{req_id}] Cleanup error: {e}")
 
             was_last_request_streaming = is_streaming_request
             last_request_completion_time = time.time()

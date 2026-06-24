@@ -323,6 +323,15 @@ async def test_should_enable_google_search(controller):
     params_no_search = {"tools": [{"function": {"name": "otherTool"}}]}
     assert controller._should_enable_google_search(params_no_search) is False
 
+    # Case 5: 开启思考模式时，即使有谷歌搜索，也应强制返回 False
+    from browser_utils.page_controller_modules.thinking import ThinkingCategory
+    controller._get_thinking_category = MagicMock(return_value=ThinkingCategory.THINKING_PRO)
+    params_with_search_and_thinking = {
+        "tools": [{"function": {"name": "googleSearch"}}],
+        "reasoning_effort": "high"
+    }
+    assert controller._should_enable_google_search(params_with_search_and_thinking, "gemini-3.1-pro-preview") is False
+
 
 @pytest.mark.asyncio
 async def test_adjust_google_search(controller, mock_check_disconnect, mock_page):
@@ -1100,6 +1109,61 @@ async def test_adjust_google_search_update_failed(
 
     # Should log warning about failed update
     toggle.click.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_adjust_google_search_disable_failed_raises(
+    controller, mock_check_disconnect, mock_page
+):
+    """思考模型需要关闭搜索时，关闭失败必须中断请求。"""
+    request_params = {"reasoning_effort": "high"}
+
+    toggle = AsyncMock()
+    toggle.get_attribute.side_effect = [
+        "true",  # 初始为开启
+        None,
+        "",
+        "true",  # 点击后仍为开启
+    ]
+    mock_page.locator.return_value = toggle
+
+    with (
+        patch.object(controller, "_supports_google_search", return_value=True),
+        patch.object(controller, "_should_enable_google_search", return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="Google Search toggle failed"):
+            await controller._adjust_google_search(
+                request_params, "gemini-3.1-pro-preview", mock_check_disconnect
+            )
+
+    toggle.click.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_adjust_google_search_disabled_on_when_expected_off_raises(
+    controller, mock_check_disconnect, mock_page
+):
+    """搜索开关被禁用且仍开启时，不能继续提交思考模型请求。"""
+    request_params = {"reasoning_effort": "high"}
+
+    toggle = AsyncMock()
+    toggle.get_attribute.side_effect = [
+        "true",  # 初始为开启
+        "true",  # disabled 属性存在
+        "",
+    ]
+    mock_page.locator.return_value = toggle
+
+    with (
+        patch.object(controller, "_supports_google_search", return_value=True),
+        patch.object(controller, "_should_enable_google_search", return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="Google Search toggle disabled"):
+            await controller._adjust_google_search(
+                request_params, "gemini-3.1-pro-preview", mock_check_disconnect
+            )
+
+    toggle.click.assert_not_called()
 
 
 @pytest.mark.asyncio

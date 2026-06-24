@@ -278,7 +278,8 @@ class ChatController(BaseController):
                 await expect_async(confirm_button_locator).to_be_hidden(
                     timeout=CLEAR_CHAT_VERIFY_TIMEOUT_MS
                 )
-                await expect_async(overlay_locator).to_be_hidden(timeout=1000)
+                # 增加等待超时，容纳非临时会话模式下的“保存中”弹窗关闭耗时
+                await expect_async(overlay_locator).to_be_hidden(timeout=15000)
                 self.logger.debug("[Chat] Dialog disappeared")
                 break
             except TimeoutError:

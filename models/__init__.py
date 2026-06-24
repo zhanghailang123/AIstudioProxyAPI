@@ -9,6 +9,7 @@ from .chat import (
 
 # Exception classes
 from .exceptions import (
+    AIStudioPermissionDeniedError,
     ClientDisconnectedError,
     QuotaExceededError,
     QuotaExceededRetry,
@@ -26,6 +27,7 @@ __all__ = [
     "Message",
     "ChatCompletionRequest",
     # Exceptions
+    "AIStudioPermissionDeniedError",
     "ClientDisconnectedError",
     "QuotaExceededError",
     "QuotaExceededRetry",

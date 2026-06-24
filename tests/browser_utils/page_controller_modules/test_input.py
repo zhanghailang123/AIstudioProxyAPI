@@ -102,6 +102,7 @@ async def test_submit_prompt_success(
 
     # Locators
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
     autosize = MagicMock()
     autosize.count = AsyncMock(return_value=1)  # Element exists
@@ -135,21 +136,31 @@ async def test_submit_prompt_success(
             new_callable=AsyncMock,
         ),
         patch.object(
+            input_controller, "_try_combo_submit", new_callable=AsyncMock
+        ) as mock_combo,
+        patch.object(
+            input_controller, "_try_enter_submit", new_callable=AsyncMock
+        ) as mock_enter,
+        patch.object(
             input_controller, "_handle_post_upload_dialog", new_callable=AsyncMock
         ) as mock_dialog,
     ):
+        mock_combo.return_value = True
+
         await input_controller.submit_prompt("Hello World", [], mock_check_disconnect)
 
-        # Verify text filled
+        # Verify text input committed through keyboard/fallback path.
         assert prompt_area.evaluate.called
         assert (
             autosize.first.evaluate.called
-        )  # Changed: first.evaluate instead of evaluate
+        )  # autosize wrapper data-value still set via evaluate
         # Verify submit button wait
         assert submit_btn.is_enabled.called
-        # Verify click
-        assert submit_btn.click.called
-        mock_dialog.assert_awaited()
+        # 优先使用官方快捷键提交，按钮点击只作为兜底。
+        assert mock_combo.called
+        assert not mock_enter.called
+        assert not submit_btn.click.called
+        mock_dialog.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -164,7 +175,8 @@ async def test_submit_prompt_with_files(
     shared_locator = MagicMock()
     shared_locator.is_enabled = AsyncMock(return_value=True)
     shared_locator.click = AsyncMock()
-    shared_locator.evaluate = AsyncMock()  # For prompt filling
+    shared_locator.fill = AsyncMock()  # Native fill for prompt input
+    shared_locator.evaluate = AsyncMock()  # Fallback for prompt filling
     shared_locator.count = AsyncMock(return_value=1)  # Element exists
     shared_locator.first = MagicMock()
     shared_locator.first.evaluate = AsyncMock()
@@ -421,6 +433,7 @@ async def test_submit_prompt_timeout(
 
     # Locators
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
 
     autosize = MagicMock()
@@ -468,6 +481,7 @@ async def test_submit_retry_logic(
     mock_check_disconnect = MagicMock(return_value=False)
 
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
 
     autosize = MagicMock()
@@ -491,8 +505,6 @@ async def test_submit_retry_logic(
 
     mock_page_controller.page.locator.side_effect = locator_side_effect
 
-    # Mock _try_enter_submit to succeed
-    # Use explicit AsyncMock assignment instead of patch.object new_callable if causing issues
     with (
         patch.object(
             input_controller, "_try_enter_submit", new_callable=AsyncMock
@@ -505,12 +517,13 @@ async def test_submit_retry_logic(
         ),
     ):
         mock_enter.return_value = True
+        mock_combo.return_value = False
 
         await input_controller.submit_prompt("test", [], mock_check_disconnect)
 
-        assert submit_btn.click.called
+        assert mock_combo.called
         assert mock_enter.called
-        assert not mock_combo.called
+        assert not submit_btn.click.called
 
 
 @pytest.mark.asyncio
@@ -522,6 +535,7 @@ async def test_submit_all_fail(
     mock_check_disconnect = MagicMock(return_value=False)
 
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
 
     autosize = MagicMock()
@@ -1004,6 +1018,7 @@ async def test_submit_prompt_is_enabled_exception(
     mock_check_disconnect = MagicMock(return_value=False)
 
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
     autosize = MagicMock()
     autosize.count = AsyncMock(return_value=1)
@@ -1062,6 +1077,7 @@ async def test_submit_prompt_exceptions_snapshots(
     mock_check_disconnect = MagicMock(return_value=False)
 
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
     autosize = MagicMock()
     autosize.count = AsyncMock(return_value=1)
@@ -1336,6 +1352,7 @@ async def test_submit_prompt_wait_button_enabled_timeout(
     """Test submit_prompt raising TimeoutError when button doesn't enable."""
     # Setup basics
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
 
     autosize = MagicMock()
@@ -1380,6 +1397,7 @@ async def test_submit_prompt_all_methods_fail(
     """Test submit_prompt raising exception when all submit methods fail."""
     # Setup
     prompt_area = MagicMock()
+    prompt_area.fill = AsyncMock()
     prompt_area.evaluate = AsyncMock()
 
     autosize = MagicMock()
@@ -1408,7 +1426,7 @@ async def test_submit_prompt_all_methods_fail(
     input_controller._open_upload_menu_and_choose_file = AsyncMock()
 
     with pytest.raises(
-        Exception, match="Submit failed: Button, Enter, and Combo key all failed"
+        Exception, match="Submit failed: Combo key, Enter, and Button all failed"
     ):
         await input_controller.submit_prompt("test", [], lambda x: None)
 

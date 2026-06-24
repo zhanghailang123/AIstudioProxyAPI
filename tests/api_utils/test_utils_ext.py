@@ -385,7 +385,12 @@ Focus: Cover uncovered error paths, exception handling, and edge cases.
 Strategy: Test None signal, error detection, dict stale data, exceptions.
 """
 
-from models.exceptions import QuotaExceededError, UpstreamError
+from config.global_state import GlobalState
+from models.exceptions import (
+    AIStudioPermissionDeniedError,
+    QuotaExceededError,
+    UpstreamError,
+)
 
 
 @pytest.mark.asyncio
@@ -449,6 +454,28 @@ async def test_use_stream_response_quota_error_by_message():
                 "req1", enable_silence_detection=True
             ):
                 pass
+
+
+@pytest.mark.asyncio
+async def test_use_stream_response_permission_denied_not_quota():
+    """403 权限拒绝不应触发额度轮换。"""
+    error_data = json.dumps(
+        {"error": True, "status": 403, "message": "permission denied"}
+    )
+
+    mock_queue = MagicMock()
+    mock_queue.get_nowait.side_effect = [error_data, queue.Empty()]
+
+    with patch.object(state, "STREAM_QUEUE", mock_queue), patch.object(state, "logger"):
+        with pytest.raises(AIStudioPermissionDeniedError) as exc_info:
+            async for chunk in use_stream_response(
+                "req1", enable_silence_detection=True
+            ):
+                pass
+
+        assert "permission denied" in str(exc_info.value).lower()
+        assert exc_info.value.req_id == "req1"
+        assert GlobalState.IS_QUOTA_EXCEEDED is False
 
 
 @pytest.mark.asyncio

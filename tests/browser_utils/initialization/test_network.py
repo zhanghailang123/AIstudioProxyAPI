@@ -65,6 +65,21 @@ async def test_route_handler_registered():
     mock_context.route.assert_called_once()
     assert callable(mock_context.route.call_args[0][1])
 
+    # CRITICAL: The route pattern must NOT be "**/*" (intercept-all).
+    # Intercepting all requests breaks the MITM proxy's TLS-fingerprint
+    # passthrough for GenerateContent requests, causing 403 "permission denied".
+    # The pattern must be a regex that only matches ListModels URLs.
+    route_pattern = mock_context.route.call_args[0][0]
+    assert route_pattern != "**/*", (
+        "Route pattern must not be '**/*' — it breaks TLS passthrough. "
+        "Use a regex that only matches ListModels URLs."
+    )
+    import re as _re
+
+    assert isinstance(route_pattern, _re.Pattern), (
+        f"Route pattern should be a compiled regex, got {type(route_pattern)}"
+    )
+
 
 @pytest.mark.asyncio
 async def test_modify_response_anti_hijack_prefix():

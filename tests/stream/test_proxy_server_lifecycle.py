@@ -151,6 +151,8 @@ async def test_handle_connect_non_intercepted_domain(proxy_server, mock_deps):
     writer.close = MagicMock()
     writer.wait_closed = AsyncMock()
 
+    # Mock reader.readline to drain CONNECT headers (returns empty line to terminate)
+    reader.readline = AsyncMock(return_value=b"\r\n")
     # Mock reader.read for dropping proxy headers
     reader.read = AsyncMock(return_value=b"")
 
@@ -196,6 +198,8 @@ async def test_handle_connect_intercepted_domain_ssl_setup(proxy_server, mock_de
     writer.transport = mock_transport
     mock_transport.get_protocol.return_value = mock_protocol
 
+    # Mock reader.readline to drain CONNECT headers (empty line terminates loop)
+    reader.readline = AsyncMock(return_value=b"\r\n")
     # Mock reader.read for dropping headers
     reader.read = AsyncMock(return_value=b"")
 
@@ -262,6 +266,7 @@ async def test_handle_connect_transport_none_before_tls(proxy_server):
     writer.wait_closed = AsyncMock()
     writer.transport = None  # Transport is None
 
+    reader.readline = AsyncMock(return_value=b"\r\n")
     reader.read = AsyncMock(return_value=b"")
 
     # Intercepted domain but transport is None
@@ -287,6 +292,7 @@ async def test_handle_connect_start_tls_returns_none(proxy_server, mock_deps):
     writer.transport = mock_transport
     mock_transport.get_protocol.return_value = MagicMock()
 
+    reader.readline = AsyncMock(return_value=b"\r\n")
     reader.read = AsyncMock(return_value=b"")
 
     # Mock start_tls to return None (error case)
@@ -323,6 +329,7 @@ async def test_handle_connect_server_connection_fails(proxy_server, mock_deps):
     writer.close = MagicMock()
     writer.wait_closed = AsyncMock()
 
+    reader.readline = AsyncMock(return_value=b"\r\n")
     reader.read = AsyncMock(return_value=b"")
 
     # Mock connection failure

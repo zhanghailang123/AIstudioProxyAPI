@@ -135,6 +135,11 @@ class AIStudioError(UpstreamError):
     def __init__(self, error_message: str, status_code: int, message: str = "AI Studio error", **kwargs):
         super().__init__(f"{message}: {error_message} (Status: {status_code})", ai_studio_status=status_code, error_message=error_message, **kwargs)
 
+class AIStudioPermissionDeniedError(UpstreamError):
+    def __init__(self, message: str = "AI Studio permission denied", **kwargs):
+        # 权限拒绝不是额度耗尽，避免触发账号轮换。
+        super().__init__(message, http_status=502, retry_after=10, **kwargs)
+
 class QuotaExceededError(UpstreamError):
     def __init__(self, message: str = "Quota exceeded", retry_after: int = 3600, **kwargs):
         super().__init__(message, retry_after=retry_after, **kwargs)

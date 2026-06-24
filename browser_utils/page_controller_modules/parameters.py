@@ -22,6 +22,7 @@ from config import (
 from models import ClientDisconnectedError
 
 from .base import BaseController
+from .thinking import ThinkingCategory
 
 
 class ParameterController(BaseController):
@@ -102,17 +103,17 @@ class ParameterController(BaseController):
                 "[Param] URL Context feature disabled, skipping adjustment"
             )
 
+        # 先调整 Google Search，避免其启用时锁死思考模式开关
+        await self._adjust_google_search(
+            request_params, model_id_to_use, check_client_disconnected
+        )
+
         # Adjust Thinking Budget
         thinking_handler = getattr(self, "_handle_thinking_budget", None)
         if thinking_handler:
             await thinking_handler(
                 request_params, model_id_to_use, check_client_disconnected
             )
-
-        # Adjust Google Search Switch
-        await self._adjust_google_search(
-            request_params, model_id_to_use, check_client_disconnected
-        )
 
     async def _adjust_temperature(
         self,
@@ -595,8 +596,20 @@ class ParameterController(BaseController):
         """Enable URL Context (legacy wrapper)."""
         await self._adjust_url_context(True, check_client_disconnected)
 
-    def _should_enable_google_search(self, request_params: Dict[str, Any]) -> bool:
+    def _should_enable_google_search(self, request_params: Dict[str, Any], model_id: Optional[str] = None) -> bool:
         """Determine if Google Search should be enabled."""
+        # 若模型开启了思考模式，谷歌搜索增强功能不能同时启用，强制返回 False 避免 403 错误
+        if model_id and hasattr(self, "_get_thinking_category"):
+            category = self._get_thinking_category(model_id)
+            if category != ThinkingCategory.NON_THINKING:
+                reasoning_effort = request_params.get("reasoning_effort")
+                if reasoning_effort != "none":
+                    self.logger.info(
+                        f"[Param] Model {model_id} supports thinking and thinking is enabled. "
+                        f"Forcing Google Search to be disabled to avoid 403 Forbidden."
+                    )
+                    return False
+
         if "tools" in request_params and request_params.get("tools") is not None:
             tools = request_params.get("tools")
             has_google_search_tool = False
@@ -641,7 +654,7 @@ class ParameterController(BaseController):
             )
             return
 
-        should_enable_search = self._should_enable_google_search(request_params)
+        should_enable_search = self._should_enable_google_search(request_params, model_id)
         desired_state = "On" if should_enable_search else "Off"
 
         toggle_selector = GROUNDING_WITH_GOOGLE_SEARCH_TOGGLE_SELECTOR
@@ -670,6 +683,14 @@ class ParameterController(BaseController):
             is_disabled = await toggle_locator.get_attribute("disabled")
             toggle_class = await toggle_locator.get_attribute("class") or ""
             if is_disabled is not None or "mdc-switch--disabled" in toggle_class:
+                if not should_enable_search:
+                    msg = (
+                        f"Google Search toggle disabled while expected Off, actual: "
+                        f"{'On' if is_currently_checked else 'Off'}"
+                    )
+                    self.logger.warning(msg)
+                    # 页面禁用开关且搜索仍开启时，继续请求会被 AI Studio 拒绝。
+                    raise RuntimeError(msg)
                 self.logger.debug(
                     "[Param] Google Search: Toggle is disabled (likely due to function calling being enabled), skipping"
                 )
@@ -690,12 +711,25 @@ class ParameterController(BaseController):
             if (new_state == "true") == should_enable_search:
                 self.logger.debug(f"[Param] Google Search: {desired_state} (Updated)")
             else:
-                self.logger.warning(
+                msg = (
                     f"Google Search toggle failed. Expected: {desired_state}, Actual: {'On' if new_state == 'true' else 'Off'}"
                 )
+                self.logger.warning(msg)
+                if not should_enable_search:
+                    # 思考模型必须关闭搜索，否则 AI Studio 可能直接返回 permission denied。
+                    raise RuntimeError(msg)
 
         except Exception as e:
             if isinstance(e, asyncio.CancelledError):
+                raise
+            if (
+                isinstance(e, RuntimeError)
+                and (
+                    "Google Search toggle failed" in str(e)
+                    or "Google Search toggle disabled" in str(e)
+                )
+            ):
+                # 关闭搜索失败会导致后续生成请求被 AI Studio 拒绝，必须中断。
                 raise
             if isinstance(e, AssertionError) and "visible" in str(e).lower():
                 self.logger.debug(

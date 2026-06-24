@@ -30,6 +30,26 @@ def mock_expect():
 
 
 @pytest.fixture(autouse=True)
+def mock_initialization_locator_wait(request):
+    """初始化单测不跑真实 Playwright 可见性等待。"""
+    if "integration" in request.keywords:
+        yield
+        return
+
+    async def _mock_find_first_visible_locator(
+        page, selectors, description="element", timeout_per_selector=30000, **kwargs
+    ):
+        selector = selectors[0] if selectors else "ms-chunk-editor"
+        return page.locator(selector), selector
+
+    with patch(
+        "config.selector_utils.find_first_visible_locator",
+        side_effect=_mock_find_first_visible_locator,
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def mock_server_state(request):
     """Automatically mock server_state.state for all browser_utils tests.
 

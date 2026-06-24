@@ -115,8 +115,9 @@ SET_THINKING_BUDGET_TOGGLE_SELECTOR = (
     '[data-test-toggle="manual-budget"] button[role="switch"].mdc-switch'
 )
 
+# 思考预算输入框（适配 type="text" 和 type="number"）
 THINKING_BUDGET_INPUT_SELECTOR = (
-    '[data-test-id="user-setting-budget-animation-wrapper"] input[type="number"]'
+    '[data-test-id="user-setting-budget-animation-wrapper"] input:not([type="range"])'
 )
 
 THINKING_LEVEL_DROPDOWN_SELECTOR = 'mat-select[aria-label="Thinking Level"]'
