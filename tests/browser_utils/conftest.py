@@ -6,6 +6,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_browser_reuse_env(monkeypatch, request):
+    """默认关闭本地复用 strict 配置，避免单测读取 .env 后等待真实页面。"""
+    if "integration" in request.keywords:
+        yield
+        return
+    monkeypatch.setenv("CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_PAGE", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_PAGE_STRICT", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_WAIT_SECONDS", "0")
+    yield
+
+
 @pytest.fixture
 def mock_expect():
     """Create a mock for playwright's expect function.

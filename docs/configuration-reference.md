@@ -24,6 +24,7 @@
 | `CAMOUFOX_WS_ENDPOINT` | 空 | 外部浏览器 WebSocket 地址；常规启动时由 launcher 注入。 |
 | `DIRECT_LAUNCH` | `false` | 跳过菜单直接按配置启动。 |
 | `ENDPOINT_CAPTURE_TIMEOUT` | `45` | 捕获浏览器 ws 端点超时时间（秒）。 |
+| `CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT` | 运行时注入 | 标记浏览器由项目 launcher 新建；strict 页面复用会据此跳过空浏览器启动拦截。 |
 | `ONLY_COLLECT_CURRENT_USER_ATTACHMENTS` | `false` | 限制附件收集范围。 |
 
 ## 3. 认证、轮转、Cookie 刷新
@@ -112,4 +113,3 @@
 - `GUI_DEFAULT_STREAM_PORT`
 - `GUI_DEFAULT_HELPER_ENDPOINT`
 - `SKIP_FRONTEND_BUILD`
-

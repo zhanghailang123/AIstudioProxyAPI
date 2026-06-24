@@ -59,6 +59,7 @@ def mock_page_controller():
     controller.page.evaluate = AsyncMock()
     controller.page.keyboard = MagicMock()
     controller.page.keyboard.press = AsyncMock()
+    controller.page.keyboard.type = AsyncMock()
     controller._check_disconnect = AsyncMock()
     return controller
 
@@ -161,6 +162,50 @@ async def test_submit_prompt_success(
         assert not mock_enter.called
         assert not submit_btn.click.called
         mock_dialog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_long_prompt_uses_bulk_input(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.click = AsyncMock()
+    prompt_area.evaluate = AsyncMock()
+    prompt_area.input_value = AsyncMock(return_value="x" * 2001)
+
+    with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "2000"}):
+        await input_controller._input_prompt_text(prompt_area, "x" * 2001)
+
+    prompt_area.evaluate.assert_called()
+    input_controller.page.keyboard.type.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_short_prompt_uses_keyboard_type(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.click = AsyncMock()
+    prompt_area.evaluate = AsyncMock()
+
+    with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "2000"}):
+        await input_controller._input_prompt_text(prompt_area, "hello")
+
+    input_controller.page.keyboard.type.assert_awaited_once()
+    prompt_area.fill.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_bulk_falls_back_to_fill_on_verify_fail(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.click = AsyncMock()
+    prompt_area.evaluate = AsyncMock()
+    prompt_area.input_value = AsyncMock(return_value="short")
+    prompt_area.fill = AsyncMock()
+
+    with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "3"}):
+        await input_controller._input_prompt_text(prompt_area, "long prompt")
+
+    prompt_area.fill.assert_awaited_once()
 
 
 @pytest.mark.asyncio

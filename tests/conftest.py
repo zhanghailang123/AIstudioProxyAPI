@@ -122,6 +122,10 @@ def mock_env(monkeypatch):
     monkeypatch.setenv("LAUNCH_MODE", "test")
     monkeypatch.setenv("STREAM_PORT", "0")
     monkeypatch.setenv("PORT", "2048")
+    monkeypatch.setenv("CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_PAGE", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_PAGE_STRICT", "false")
+    monkeypatch.setenv("REUSE_EXISTING_AISTUDIO_WAIT_SECONDS", "0")
 
 
 @pytest.fixture

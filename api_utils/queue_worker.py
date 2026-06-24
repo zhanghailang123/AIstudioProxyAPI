@@ -13,9 +13,32 @@ from playwright.async_api import Locator
 from playwright.async_api import expect as expect_async
 
 from api_utils.context_types import QueueItem
+from config import AI_STUDIO_URL_PATTERN, INPUT_SELECTOR
 from models import AIStudioPermissionDeniedError, QuotaExceededError
 
 from .client_connection import check_client_connection
+
+
+async def _force_goto_new_chat(page, logger, req_id: str, reason: str) -> bool:
+    """失败后直接回到新聊天页，避免脏页面影响后续请求。"""
+    if not page or page.is_closed():
+        return False
+
+    target_base_url = f"https://{AI_STUDIO_URL_PATTERN}".rstrip("/")
+    target_url = f"{target_base_url}/prompts/new_chat"
+    try:
+        logger.warning(f"[{req_id}] 页面恢复：{reason}，跳转到新聊天页...")
+        try:
+            await page.evaluate("window.stop()")
+        except Exception:
+            pass
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        await expect_async(page.locator(INPUT_SELECTOR)).to_be_visible(timeout=15000)
+        logger.info(f"[{req_id}] 页面恢复完成: {target_url}")
+        return True
+    except Exception as goto_err:
+        logger.error(f"[{req_id}] 页面恢复失败: {goto_err}")
+        return False
 
 
 async def queue_worker() -> None:
@@ -427,23 +450,16 @@ async def queue_worker() -> None:
                 try:
                     await clear_stream_queue()
 
-                    # 如果请求处理失败，执行页面强制刷新兜底，防止浏览器状态卡死影响下一次请求
+                    # 如果请求处理失败，直接回到新聊天页，防止脏页面影响下一次请求
                     if (
                         request_failed
                         and not permission_denied_error
                         and state.page_instance
                         and not state.page_instance.is_closed()
                     ):
-                        try:
-                            logger.warning(f"[{req_id}] 请求处理失败，执行页面强制刷新兜底...")
-                            try:
-                                # 尝试停止任何挂起的加载
-                                await state.page_instance.evaluate("window.stop()")
-                            except Exception:
-                                pass
-                            await state.page_instance.reload(timeout=15000)
-                        except Exception as reload_err:
-                            logger.error(f"[{req_id}] 兜底页面刷新失败: {reload_err}")
+                        await _force_goto_new_chat(
+                            state.page_instance, logger, req_id, "请求处理失败"
+                        )
 
                     # [COOKIE-REFRESH] 请求成功后尝试刷新Cookie
                     if not client_disconnected_early and not GlobalState.IS_QUOTA_EXCEEDED:
@@ -489,17 +505,15 @@ async def queue_worker() -> None:
                                     )
                                 except asyncio.TimeoutError:
                                     logger.warning(
-                                        f"[{req_id}] clear_chat_history timed out after 30s, reloading page"
+                                        f"[{req_id}] clear_chat_history timed out after 30s"
                                     )
-                                    try:
-                                        await s_page.reload(timeout=15000)
-                                    except Exception:
-                                        pass
+                                    await _force_goto_new_chat(
+                                        s_page, logger, req_id, "清理聊天超时"
+                                    )
                                 except Exception:
-                                    try:
-                                        await s_page.reload()
-                                    except Exception:
-                                        pass
+                                    await _force_goto_new_chat(
+                                        s_page, logger, req_id, "清理聊天失败"
+                                    )
                 except Exception as e:
                     logger.error(f"[{req_id}] Cleanup error: {e}")
 

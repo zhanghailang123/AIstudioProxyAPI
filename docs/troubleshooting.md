@@ -95,6 +95,8 @@
 
 ```env
 REUSE_EXISTING_AISTUDIO_PAGE=true
+REUSE_EXISTING_AISTUDIO_PAGE_STRICT=true
+REUSE_EXISTING_AISTUDIO_WAIT_SECONDS=45
 ```
 
 使用方式：
@@ -104,7 +106,24 @@ REUSE_EXISTING_AISTUDIO_PAGE=true
 3. 重启服务端，让初始化日志出现 `[BrowserReuse] Reusing existing AI Studio page...`。
 4. 再发 API 请求。
 
+建议连接外部/已手动打开的浏览器时开启 strict 模式。strict 模式下，如果没有找到已打开的 AI Studio prompt 页面，服务端会等待 `REUSE_EXISTING_AISTUDIO_WAIT_SECONDS` 秒，仍找不到就启动失败，不再静默退回新建 `storage_state` 上下文。由项目 `launch_camoufox.py` 新建的空浏览器会自动跳过 strict 启动拦截，避免服务刚启动就因没有手动页面而退出。
+
 如果复用页面后请求成功，说明原先失败主要来自新建 `storage_state` 隔离上下文、认证文件状态或自动化上下文差异；应刷新/重存 auth profile，或继续保持调试复用模式验证。若复用页面后仍返回 `The caller does not have permission`，再重点排查代理出口、模型权限、账号地域/产品权限和自动化指纹。
+
+### 长 prompt 输入很慢
+
+如果日志里出现很长的 `prompt_chars`，但迟迟没有 `Attempting combo submission`，通常是提示词仍卡在输入阶段。当前可用：
+
+```env
+LONG_PROMPT_BULK_INPUT_THRESHOLD=2000
+```
+
+超过该字符数会使用批量写入，并在日志中输出：
+
+- `[Input] Using bulk input for long prompt...`
+- `[Input] Prompt input completed in ...s`
+
+短 prompt 仍保留逐字键入，减少 UI 兼容和自动化特征风险。
 
 ---
 

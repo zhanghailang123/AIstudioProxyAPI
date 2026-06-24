@@ -1656,6 +1656,8 @@ if __name__ == "__main__":
 
     if captured_ws_endpoint:
         os.environ["CAMOUFOX_WS_ENDPOINT"] = captured_ws_endpoint
+        # 标记由项目启动器新建的浏览器，初始化 strict 复用时用于区分外部浏览器。
+        os.environ["CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT"] = "true"
     else:
         logger.error(
             "  Critical Logic Error: WebSocket endpoint not captured but program continuing."
@@ -1726,6 +1728,7 @@ if __name__ == "__main__":
     logger.info("  Environment variables set for server.app:")
     env_keys_to_log = [
         "CAMOUFOX_WS_ENDPOINT",
+        "CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT",
         "LAUNCH_MODE",
         "SERVER_LOG_LEVEL",
         "SERVER_REDIRECT_PRINT",

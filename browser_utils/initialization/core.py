@@ -48,6 +48,23 @@ def _is_truthy_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _should_enforce_reuse_strict(launch_mode: str) -> bool:
+    """内部启动器新建的浏览器不强制 strict，避免空浏览器启动失败。"""
+    strict_requested = _is_truthy_env("REUSE_EXISTING_AISTUDIO_PAGE_STRICT", False)
+    if not strict_requested:
+        return False
+
+    if _is_truthy_env("CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT", False):
+        logger.warning(
+            "[BrowserReuse] Strict reuse requested, but this browser was launched "
+            f"by the project launcher in {launch_mode} mode; strict startup guard "
+            "will be skipped."
+        )
+        return False
+
+    return True
+
+
 def _iter_browser_contexts(browser: AsyncBrowser) -> list[AsyncBrowserContext]:
     """安全读取已连接浏览器中的上下文列表。"""
     contexts = getattr(browser, "contexts", [])
@@ -105,6 +122,20 @@ async def _wait_for_shutdown():
         await asyncio.sleep(0.1)
 
 
+async def _wait_for_existing_ai_studio_page(
+    browser: AsyncBrowser, target_url_base: str, timeout_seconds: float
+) -> Optional[Tuple[AsyncBrowserContext, AsyncPage, str]]:
+    """等待用户在已连接浏览器中打开 AI Studio 页面。"""
+    deadline = asyncio.get_event_loop().time() + max(0.0, timeout_seconds)
+    while True:
+        existing_match = _find_existing_ai_studio_page(browser, target_url_base)
+        if existing_match:
+            return existing_match
+        if asyncio.get_event_loop().time() >= deadline:
+            return None
+        await asyncio.sleep(1.0)
+
+
 async def initialize_page_logic(  # pragma: no cover
     browser: AsyncBrowser, storage_state_path: Optional[str] = None
 ) -> Tuple[AsyncPage, bool]:
@@ -122,6 +153,13 @@ async def initialize_page_logic(  # pragma: no cover
     launch_mode = os.environ.get("LAUNCH_MODE", "debug")
     loop = asyncio.get_running_loop()
     reuse_existing_page = _is_truthy_env("REUSE_EXISTING_AISTUDIO_PAGE", False)
+    reuse_existing_page_strict = _should_enforce_reuse_strict(launch_mode)
+    try:
+        reuse_wait_seconds = float(
+            os.environ.get("REUSE_EXISTING_AISTUDIO_WAIT_SECONDS", "45")
+        )
+    except (TypeError, ValueError):
+        reuse_wait_seconds = 45.0
 
     # Prioritize the passed storage_state_path
     if storage_state_path:
@@ -234,8 +272,8 @@ async def initialize_page_logic(  # pragma: no cover
 
     try:
         found_page: Optional[AsyncPage] = None
-        target_url_base = f"https://{AI_STUDIO_URL_PATTERN}"
-        target_full_url = f"{target_url_base}prompts/new_chat"
+        target_url_base = f"https://{AI_STUDIO_URL_PATTERN}".rstrip("/")
+        target_full_url = f"{target_url_base}/prompts/new_chat"
         login_url_pattern = "accounts.google.com"
         current_url = ""
 
@@ -244,6 +282,14 @@ async def initialize_page_logic(  # pragma: no cover
 
         if reuse_existing_page:
             existing_match = _find_existing_ai_studio_page(browser, target_url_base)
+            if not existing_match and reuse_existing_page_strict:
+                logger.warning(
+                    "[BrowserReuse] Strict reuse requested but no existing AI Studio "
+                    f"prompt page was found. Waiting {reuse_wait_seconds:.0f}s..."
+                )
+                existing_match = await _wait_for_existing_ai_studio_page(
+                    browser, target_url_base, reuse_wait_seconds
+                )
             if existing_match:
                 temp_context, found_page, current_url = existing_match
                 logger.info(
@@ -265,10 +311,19 @@ async def initialize_page_logic(  # pragma: no cover
                     "[BrowserReuse] storage_state skipped; using live browser context."
                 )
             else:
-                logger.info(
-                    "[BrowserReuse] No existing AI Studio prompt page found; "
-                    "creating a fresh context."
+                message = (
+                    "[BrowserReuse] No existing AI Studio prompt page found."
                 )
+                if reuse_existing_page_strict:
+                    logger.error(
+                        message
+                        + " Strict mode is enabled; refusing to create a fresh context."
+                    )
+                    raise RuntimeError(
+                        "REUSE_EXISTING_AISTUDIO_PAGE_STRICT is enabled but no "
+                        "existing AI Studio prompt page was found."
+                    )
+                logger.info(message + " Creating a fresh context.")
 
         if not found_page:
             # Consolidate into one log message

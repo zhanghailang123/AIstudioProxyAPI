@@ -1,5 +1,8 @@
 import asyncio
+import inspect
+import os
 import random
+import time
 from typing import Callable, List
 
 from playwright.async_api import TimeoutError
@@ -25,6 +28,166 @@ from .base import BaseController
 
 class InputController(BaseController):
     """Handles prompt input and submission."""
+
+    async def _maybe_await(self, value):
+        """兼容真实 Playwright 协程和测试里的同步 mock。"""
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def _long_prompt_threshold(self) -> int:
+        """长提示词阈值，超过后不再逐字键入。"""
+        try:
+            return int(os.environ.get("LONG_PROMPT_BULK_INPUT_THRESHOLD", "2000"))
+        except (TypeError, ValueError):
+            return 2000
+
+    async def _commit_prompt_events(self, prompt_textarea_locator) -> None:
+        """触发前端表单提交前需要的输入/校验事件。"""
+        await prompt_textarea_locator.evaluate(
+            """
+            (element) => {
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: null,
+                }));
+                element.dispatchEvent(new Event('change', {
+                    bubbles: true,
+                    cancelable: true,
+                }));
+                element.blur();
+                element.focus();
+            }
+            """
+        )
+
+    async def _read_prompt_value(self, prompt_textarea_locator) -> str:
+        """读取当前输入框值，兼容 textarea 和 contenteditable。"""
+        try:
+            return await prompt_textarea_locator.input_value(timeout=3000) or ""
+        except Exception:
+            try:
+                return (
+                    await prompt_textarea_locator.evaluate(
+                        """
+                        (element) => {
+                            return element.value
+                                ?? element.textContent
+                                ?? element.getAttribute('data-value')
+                                ?? '';
+                        }
+                        """
+                    )
+                    or ""
+                )
+            except Exception:
+                return ""
+
+    async def _bulk_set_prompt(self, prompt_textarea_locator, prompt: str) -> None:
+        """批量写入长提示词，并同步 Angular 表单状态。"""
+        await prompt_textarea_locator.evaluate(
+            """
+            (element, text) => {
+                element.focus();
+                const proto = Object.getPrototypeOf(element);
+                const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(element, text);
+                } else {
+                    element.value = text;
+                }
+                element.setAttribute('data-value', text);
+                element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+                element.dispatchEvent(new InputEvent('beforeinput', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertFromPaste',
+                    data: text,
+                }));
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertFromPaste',
+                    data: text,
+                }));
+                element.dispatchEvent(new CompositionEvent('compositionend', {
+                    bubbles: true,
+                    data: text,
+                }));
+                element.dispatchEvent(new Event('change', {
+                    bubbles: true,
+                    cancelable: true,
+                }));
+                element.blur();
+                element.focus();
+            }
+            """,
+            prompt,
+        )
+
+    async def _input_prompt_text(self, prompt_textarea_locator, prompt: str) -> None:
+        """根据长度选择输入方式并校验写入结果。"""
+        prompt_len = len(prompt)
+        threshold = self._long_prompt_threshold()
+        started = time.perf_counter()
+
+        await self._maybe_await(prompt_textarea_locator.click(timeout=5000))
+        await asyncio.sleep(0.2)
+
+        if prompt_len > threshold:
+            self.logger.info(
+                f"[Input] Using bulk input for long prompt: {prompt_len} chars "
+                f"(threshold={threshold})"
+            )
+            try:
+                await self._bulk_set_prompt(prompt_textarea_locator, prompt)
+                await asyncio.sleep(0.2)
+                current_value = await self._read_prompt_value(prompt_textarea_locator)
+                if current_value != prompt:
+                    raise ValueError(
+                        f"bulk input verification failed: {len(current_value)} != {prompt_len}"
+                    )
+            except Exception as bulk_err:
+                self.logger.warning(
+                    f"[Input] Bulk input failed ({bulk_err}), falling back to fill()."
+                )
+                await prompt_textarea_locator.fill(prompt, timeout=30000)
+                await asyncio.sleep(0.2)
+                await self._commit_prompt_events(prompt_textarea_locator)
+        else:
+            self.logger.debug(
+                f"[Input] Using keyboard.type for short prompt: {prompt_len} chars"
+            )
+            try:
+                await self.page.keyboard.type(
+                    prompt,
+                    delay=random.randint(15, 45),
+                )
+                await asyncio.sleep(0.5)
+                await self._commit_prompt_events(prompt_textarea_locator)
+            except Exception as type_err:
+                self.logger.debug(
+                    f"[Input] keyboard.type() failed ({type_err}), "
+                    f"falling back to fill()."
+                )
+                try:
+                    await prompt_textarea_locator.fill(prompt, timeout=10000)
+                    await asyncio.sleep(0.5)
+                    await self._commit_prompt_events(prompt_textarea_locator)
+                except Exception as fill_err:
+                    self.logger.debug(
+                        f"[Input] fill() also failed ({fill_err}), "
+                        f"falling back to JS evaluate."
+                    )
+                    await self._bulk_set_prompt(prompt_textarea_locator, prompt)
+                    await asyncio.sleep(0.5)
+
+        elapsed = time.perf_counter() - started
+        self.logger.info(
+            f"[Input] Prompt input completed in {elapsed:.2f}s ({prompt_len} chars)"
+        )
 
     async def submit_prompt(
         self, prompt: str, image_list: List, check_client_disconnected: Callable
@@ -52,94 +215,7 @@ class InputController(BaseController):
                 check_client_disconnected, "After Input Visible"
             )
 
-            # --- Input method: keyboard.type() with random delays ---
-            #
-            # CRITICAL ANTI-DETECTION MEASURE:
-            #
-            # Playwright's fill() uses CDP's Input.insertText, which:
-            #   - Does NOT generate keydown/keypress/keyup events
-            #   - Is a single atomic operation visible to the browser engine
-            #   - Can be detected by Google's AI Studio frontend JavaScript
-            #
-            # page.keyboard.type() uses CDP's Input.dispatchKeyEvent for
-            # each character, generating the FULL keyboard event chain
-            # (keydown → keypress → input → keyup).  Combined with random
-            # inter-character delays, this closely mimics real user input
-            # and is much harder for anti-automation systems to detect.
-            #
-            # The previous JS evaluate() approach (element.value = text) was
-            # abandoned because it bypasses Angular's reactive form value
-            # accessor, leaving the form state stale.  keyboard.type()
-            # properly updates the Angular form state via native input events.
-            try:
-                # Focus the textarea first (required before keyboard.type)
-                await prompt_textarea_locator.click(timeout=5000)
-                await asyncio.sleep(0.2)
-
-                # Type character by character with random delays.
-                # delay range 15-45ms ≈ ~30-90 WPM, fast human typing.
-                # For a 200-char prompt: 15*200=3s to 45*200=9s.
-                await self.page.keyboard.type(
-                    prompt,
-                    delay=random.randint(15, 45),
-                )
-
-                # Give Angular's reactive forms time to process the final
-                # input event dispatched by the last keystroke.
-                await asyncio.sleep(0.5)
-
-                # Dispatch blur and re-focus to trigger Angular's form
-                # validation and ensure the ControlValueAccessor has
-                # committed the value.
-                await prompt_textarea_locator.evaluate(
-                    """
-                    (element) => {
-                        element.blur();
-                        element.focus();
-                    }
-                    """
-                )
-                self.logger.debug(
-                    f"[Input] Typed {len(prompt)} chars via keyboard.type()"
-                )
-            except Exception as type_err:
-                # Fallback: Playwright fill() if keyboard.type() fails
-                # (e.g. element lost focus or page navigated away).
-                self.logger.debug(
-                    f"[Input] keyboard.type() failed ({type_err}), "
-                    f"falling back to fill()."
-                )
-                try:
-                    await prompt_textarea_locator.fill(prompt, timeout=10000)
-                    await asyncio.sleep(0.5)
-                    await prompt_textarea_locator.evaluate(
-                        """
-                        (element) => {
-                            element.blur();
-                            element.focus();
-                        }
-                        """
-                    )
-                except Exception as fill_err:
-                    # Last resort: JS evaluate with native events
-                    self.logger.debug(
-                        f"[Input] fill() also failed ({fill_err}), "
-                        f"falling back to JS evaluate."
-                    )
-                    await prompt_textarea_locator.evaluate(
-                        """
-                        (element, text) => {
-                            element.focus();
-                            element.value = text;
-                            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                            element.blur();
-                            element.focus();
-                        }
-                        """,
-                        prompt,
-                    )
-                    await asyncio.sleep(0.5)
+            await self._input_prompt_text(prompt_textarea_locator, prompt)
             autosize_target = autosize_wrapper_locator
             if await autosize_target.count() == 0:
                 autosize_target = legacy_autosize_wrapper

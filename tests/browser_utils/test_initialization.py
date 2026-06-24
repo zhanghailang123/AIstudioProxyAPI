@@ -256,6 +256,73 @@ async def test_initialize_page_logic_reuse_disabled_ignores_browser_contexts(
 
 
 @pytest.mark.asyncio
+async def test_initialize_page_logic_reuse_strict_fails_without_existing_page(
+    mock_browser,
+    mock_browser_context,
+    mock_server_state,
+):
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "LAUNCH_MODE": "debug",
+                "REUSE_EXISTING_AISTUDIO_PAGE": "true",
+                "REUSE_EXISTING_AISTUDIO_PAGE_STRICT": "true",
+                "REUSE_EXISTING_AISTUDIO_WAIT_SECONDS": "0",
+            },
+        ),
+        patch("os.path.exists", return_value=False),
+    ):
+        mock_browser.contexts = []
+
+        with pytest.raises(RuntimeError, match="STRICT"):
+            await _initialize_page_logic(mock_browser)
+
+        mock_browser.new_context.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initialize_page_logic_reuse_strict_skipped_for_project_browser(
+    mock_browser,
+    mock_browser_context,
+    mock_page,
+    mock_expect,
+    mock_server_state,
+):
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "LAUNCH_MODE": "debug",
+                "CAMOUFOX_BROWSER_LAUNCHED_BY_PROJECT": "true",
+                "REUSE_EXISTING_AISTUDIO_PAGE": "true",
+                "REUSE_EXISTING_AISTUDIO_PAGE_STRICT": "true",
+                "REUSE_EXISTING_AISTUDIO_WAIT_SECONDS": "0",
+            },
+        ),
+        patch(
+            "browser_utils.initialization.core.setup_network_interception_and_scripts",
+            new_callable=AsyncMock,
+        ),
+        patch("browser_utils.initialization.core.setup_debug_listeners"),
+    ):
+        mock_browser.contexts = []
+        mock_browser_context.pages = []
+        mock_browser_context.new_page.return_value = mock_page
+        mock_page.url = "https://aistudio.google.com/prompts/new_chat"
+        mock_page.locator.return_value.first.inner_text = AsyncMock(
+            return_value="Gemini 1.5 Pro"
+        )
+
+        page, ready = await _initialize_page_logic(mock_browser)
+
+        assert page == mock_page
+        assert ready is True
+        mock_browser.new_context.assert_called_once()
+        mock_browser_context.new_page.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_wait_for_shutdown_task_is_cancellable():
     task = asyncio.create_task(_wait_for_shutdown())
     await asyncio.sleep(0)
