@@ -171,6 +171,8 @@ async def test_input_prompt_long_prompt_uses_bulk_input(input_controller):
     prompt_area.click = AsyncMock()
     prompt_area.evaluate = AsyncMock()
     prompt_area.input_value = AsyncMock(return_value="x" * 2001)
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+    prompt_area.focus = AsyncMock()
 
     with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "2000"}):
         await input_controller._input_prompt_text(prompt_area, "x" * 2001)
@@ -185,6 +187,8 @@ async def test_input_prompt_short_prompt_uses_keyboard_type(input_controller):
     prompt_area = MagicMock()
     prompt_area.click = AsyncMock()
     prompt_area.evaluate = AsyncMock()
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+    prompt_area.focus = AsyncMock()
 
     with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "2000"}):
         await input_controller._input_prompt_text(prompt_area, "hello")
@@ -201,11 +205,72 @@ async def test_input_prompt_bulk_falls_back_to_fill_on_verify_fail(input_control
     prompt_area.evaluate = AsyncMock()
     prompt_area.input_value = AsyncMock(return_value="short")
     prompt_area.fill = AsyncMock()
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+    prompt_area.focus = AsyncMock()
 
     with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "3"}):
         await input_controller._input_prompt_text(prompt_area, "long prompt")
 
     prompt_area.fill.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_bulk_retries_with_chunked_input(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.click = AsyncMock()
+    prompt_area.evaluate = AsyncMock()
+    prompt_area.input_value = AsyncMock(side_effect=["short", "x" * 9001])
+    prompt_area.fill = AsyncMock()
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+    prompt_area.focus = AsyncMock()
+
+    with patch.dict("os.environ", {"LONG_PROMPT_BULK_INPUT_THRESHOLD": "3"}):
+        await input_controller._input_prompt_text(prompt_area, "x" * 9001)
+
+    prompt_area.fill.assert_not_awaited()
+    assert prompt_area.evaluate.await_count >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_click_failure_falls_back_to_focus(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.click = AsyncMock()
+    prompt_area.focus = AsyncMock()
+    prompt_area.evaluate = AsyncMock(side_effect=[True, True])
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+
+    await input_controller._ensure_prompt_focus(prompt_area)
+
+    prompt_area.focus.assert_awaited_once()
+    prompt_area.click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_input_prompt_focus_failure_falls_back_to_click(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.focus = AsyncMock(side_effect=[Exception("focus fail"), Exception("focus fail")])
+    prompt_area.click = AsyncMock()
+    prompt_area.evaluate = AsyncMock(side_effect=[True, True, True])
+    prompt_area.scroll_into_view_if_needed = AsyncMock()
+
+    await input_controller._ensure_prompt_focus(prompt_area)
+
+    assert prompt_area.focus.await_count == 2
+    prompt_area.click.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_wait_for_prompt_interactable_retries_until_ready(input_controller):
+    prompt_area = MagicMock()
+    prompt_area.evaluate = AsyncMock(side_effect=[False, False, True])
+
+    await input_controller._wait_for_prompt_interactable(prompt_area, timeout_ms=1000)
+
+    assert prompt_area.evaluate.await_count == 3
 
 
 @pytest.mark.asyncio

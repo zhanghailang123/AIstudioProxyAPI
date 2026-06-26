@@ -125,6 +125,103 @@ LONG_PROMPT_BULK_INPUT_THRESHOLD=2000
 
 短 prompt 仍保留逐字键入，减少 UI 兼容和自动化特征风险。
 
+### 恢复后输入框 `click` 超时
+
+如果日志集中出现下面这类报错：
+
+- `Locator.click: Timeout 5000ms exceeded`
+- `locator resolved to <textarea ... aria-label="Enter a prompt"...>`
+- 随后紧跟 `页面恢复：请求处理失败，跳转到新聊天页...`
+
+通常不是“新开了一个浏览器导致失败”，而是同一个已连接页面在恢复到 `new_chat` 后，输入框虽然已经可见，但还没完全进入可交互状态，或被 tooltip / overlay / 右侧面板瞬时遮挡。
+
+当前修复点：
+
+1. 输入框聚焦改为 `focus` 优先，`click` 只作为降级兜底。
+2. `goto(new_chat)` 恢复后，除了等待输入框可见，还会继续等待它进入“可交互”状态。
+3. 恢复完成前会先尝试发送一次 `Escape`，清理残留 tooltip / overlay。
+
+因此如果你仍观察到“窗口像闪了一下”，更可能是页面导航重绘，而不是重新创建 browser / context / page。
+
+### 本地出现两个浏览器窗口
+
+如果任务栏里同时看到：
+
+1. 一个已打开的 `Google AI Studio` 页面
+2. 一个空白的 `Camoufox` 窗口
+
+通常是启动器先拉起了浏览器默认空白页，随后服务端又在新的 context/page 里打开了 AI Studio。真正处理请求的是 AI Studio 页，空白 `Camoufox` 窗口只是启动残留。
+
+当前修复会在成功拿到 AI Studio 页面后，主动回收其它 context 里的 `about:blank` / `data:,` 空白页，减少双窗口现象，同时避免这类空白页继续干扰“复用已有 AI Studio 页面”的判断。
+
+### 调用方拿到的是分析稿，不是最终答案
+
+如果业务 prompt 要求模型按：
+
+```text
+<analysis>...</analysis>
+<answer>...</answer>
+```
+
+输出，而调用方却拿到了整段 `<analysis>`，通常不是输入问题，而是响应解析没有把结构化标签拆开。当前 DOM 返回路径已兼容：
+
+- `[THINKING]...[/THINKING]`
+- `<analysis>...</analysis>`
+- `<answer>...</answer>`
+- `<final>...</final>`
+
+当 `INCLUDE_REASONING_IN_OPENAI_OUTPUT=false` 时，会优先把 `<answer>` / `<final>` 作为 `content` 返回，把 `<analysis>` 归入 `reasoning_content`，避免调用方把分析稿误当成最终答案。
+
+### 外部调用方报 `0xEF is an invalid start of a value`
+
+如果服务端日志已经显示：
+
+- `Successfully retrieved content directly (...)`
+- `Token usage stats: ...`
+
+但外部调用方仍报类似：
+
+- `JsonReaderException`
+- `'0xEF' is an invalid start of a value`
+- “非流式降级也失败”
+
+优先怀疑的是“对外返回格式不兼容”，而不是 AI Studio 没拿到内容。
+
+这个项目里，旧逻辑会在非流式响应体较大时，把本应一次性返回的 JSON 包成 `StreamingResponse(application/json)` 分块输出。部分外部 SDK，尤其带“流式失败后自动降级非流式”逻辑的客户端，对这种 chunked JSON 兼容较差，可能把返回体当成异常编码或非标准 JSON。
+
+当前修复后：
+
+1. `stream=false` 的请求始终返回标准 `JSONResponse`
+2. 只有真正的流式请求才返回 `text/event-stream`
+
+如果外部仍报同类错误，再继续检查调用方是否对响应字节流做了额外 BOM 处理、重复解码，或把 SSE 降级结果继续按普通 JSON 二次解析。
+
+### 长 prompt 输入很慢、结果提取偶发失败
+
+如果日志里出现：
+
+- `[Input] Using bulk input for long prompt...`
+- `Bulk input verification mismatch`
+- `Edit button click intercepted`
+- `(Helper DOM) Successfully extracted DOM content`
+
+说明长 prompt 已切换到分段批量注入，结果提取也已增加 DOM 兜底。
+
+当前策略是：
+
+1. 长 prompt 先走批量注入
+2. 校验不一致时自动重试分段注入
+3. `Edit`/`Copy` 都失败时，直接从最后一条模型消息 DOM 提取正文
+
+这样可以避免“输入成功但取不回内容”时一直卡住。
+
+补充说明：
+
+- DOM 兜底现在会主动排除 `Thoughts` / `ms-thought-chunk` 区域
+- 优先提取最后一条模型消息中的正文 `text-chunk`
+
+这样可以避免把思考稿和最终正文混在一起返回给调用方。
+
 ---
 
 ## 6. Docker 常见问题

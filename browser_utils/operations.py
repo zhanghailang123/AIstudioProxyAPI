@@ -831,7 +831,15 @@ async def get_response_via_edit_button(
 
             await expect_async(edit_button).to_be_visible(timeout=CLICK_TIMEOUT_MS)
             check_client_disconnected("Edit Response - 'Edit' button visible after: ")
-            await edit_button.click(timeout=CLICK_TIMEOUT_MS)
+            try:
+                await edit_button.click(timeout=CLICK_TIMEOUT_MS)
+            except Exception as click_err:
+                if "intercepts pointer events" not in str(click_err).lower():
+                    raise
+                logger.warning(
+                    f"[{req_id}]   - 'Edit' button click intercepted, retrying with force click."
+                )
+                await edit_button.click(timeout=CLICK_TIMEOUT_MS, force=True)
             logger.info(f"[{req_id}]   - 'Edit' button clicked.")
         except (ClientDisconnectedError, asyncio.CancelledError):
             raise
@@ -1075,6 +1083,87 @@ async def get_response_via_copy_button(
         return None
 
 
+async def _extract_response_via_dom(
+    page: AsyncPage, req_id: str, check_client_disconnected: Callable
+) -> Optional[str]:
+    """DOM 鍏滃簳鎻愬彇锛岄伩鍏?Edit/Copy 閮藉け璐ユ椂鐩存帴涓㈠け妯″瀷杈撳嚭銆?"""
+    logger.info(f"[{req_id}] (Helper DOM) Attempting DOM fallback extraction...")
+    try:
+        check_client_disconnected("DOM Response - before extraction: ")
+        dom_text = await page.evaluate(
+            """
+            () => {
+                const normalize = (text) => (text || '')
+                    .replace(/\\r/g, '')
+                    .split('\\n')
+                    .map((line) => line.trimEnd())
+                    .join('\\n')
+                    .trim();
+
+                const extractVisibleText = (node) => {
+                    if (!node) return '';
+                    const clone = node.cloneNode(true);
+                    clone.querySelectorAll('ms-thought-chunk, .thought-panel, [aria-label="Thoughts"]').forEach((el) => el.remove());
+                    return normalize(clone.innerText || clone.textContent || '');
+                };
+
+                const lastTurn = document.querySelector('ms-chat-turn:last-of-type');
+                if (!lastTurn) {
+                    return '';
+                }
+
+                const preferredNodes = [
+                    ...lastTurn.querySelectorAll(
+                        '[data-turn-role="Model"] ms-prompt-chunk.text-chunk,' +
+                        ' [data-turn-role="Model"] .text-chunk,' +
+                        ' .model-prompt-container ms-prompt-chunk.text-chunk,' +
+                        ' .model-prompt-container .text-chunk'
+                    )
+                ];
+
+                for (const node of preferredNodes) {
+                    const text = extractVisibleText(node);
+                    if (text) {
+                        return text;
+                    }
+                }
+
+                const modelContainers = [
+                    ...lastTurn.querySelectorAll(
+                        '[data-turn-role="Model"], .model-prompt-container, ms-prompt-chunk'
+                    )
+                ];
+                for (const node of modelContainers) {
+                    const text = extractVisibleText(node);
+                    if (text) {
+                        return text;
+                    }
+                }
+                return '';
+            }
+            """
+        )
+        check_client_disconnected("DOM Response - after extraction: ")
+        if not isinstance(dom_text, str):
+            return None
+        cleaned = dom_text.strip()
+        if cleaned:
+            preview = cleaned[:100].replace("\n", "\\n")
+            logger.info(
+                f"[{req_id}] (Helper DOM) Successfully extracted DOM content "
+                f"(length={len(cleaned)}): '{preview}...'"
+            )
+            return cleaned
+        logger.warning(f"[{req_id}] (Helper DOM) DOM fallback returned empty content.")
+        return None
+    except (ClientDisconnectedError, asyncio.CancelledError):
+        raise
+    except Exception as dom_err:
+        logger.error(f"[{req_id}] (Helper DOM) DOM fallback failed: {dom_err}")
+        await save_error_snapshot(f"dom_response_extract_failed_{req_id}")
+        return None
+
+
 async def _wait_for_response_completion(
     page: AsyncPage,
     prompt_textarea_locator: Locator,
@@ -1303,6 +1392,21 @@ async def _get_final_response_content(
 
     logger.error(
         f"[{req_id}] (Helper GetContent) All response content retrieval methods failed."
+    )
+    logger.warning(
+        f"[{req_id}] (Helper GetContent) Falling back to DOM extraction..."
+    )
+    response_content = await _extract_response_via_dom(
+        page, req_id, check_client_disconnected
+    )
+    if response_content is not None:
+        logger.info(
+            f"[{req_id}] (Helper GetContent) Successfully obtained content via DOM fallback."
+        )
+        return response_content
+
+    logger.error(
+        f"[{req_id}] (Helper GetContent) DOM fallback also failed."
     )
     await save_error_snapshot(f"get_content_all_methods_failed_{req_id}")
     return None

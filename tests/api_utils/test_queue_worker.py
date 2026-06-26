@@ -13,6 +13,10 @@ async def test_force_goto_new_chat_success():
     page.is_closed = MagicMock(return_value=False)
     page.evaluate = AsyncMock()
     page.goto = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+    page.wait_for_function = AsyncMock()
+    page.keyboard = MagicMock()
+    page.keyboard.press = AsyncMock()
     locator = MagicMock()
     page.locator = MagicMock(return_value=locator)
     logger = MagicMock()
@@ -27,6 +31,9 @@ async def test_force_goto_new_chat_success():
     page.evaluate.assert_awaited_once_with("window.stop()")
     page.goto.assert_awaited_once()
     expect_result.to_be_visible.assert_awaited_once()
+    page.wait_for_load_state.assert_awaited_once_with("networkidle", timeout=10000)
+    page.wait_for_function.assert_awaited_once()
+    page.keyboard.press.assert_awaited_once_with("Escape")
 
 
 @pytest.mark.asyncio
@@ -35,6 +42,10 @@ async def test_force_goto_new_chat_returns_false_on_goto_error():
     page.is_closed = MagicMock(return_value=False)
     page.evaluate = AsyncMock()
     page.goto = AsyncMock(side_effect=Exception("nav failed"))
+    page.wait_for_load_state = AsyncMock()
+    page.wait_for_function = AsyncMock()
+    page.keyboard = MagicMock()
+    page.keyboard.press = AsyncMock()
     logger = MagicMock()
 
     result = await _force_goto_new_chat(page, logger, "req1", "测试恢复")

@@ -78,6 +78,48 @@ def _iter_browser_contexts(browser: AsyncBrowser) -> list[AsyncBrowserContext]:
     return []
 
 
+def _is_disposable_blank_page(page: AsyncPage) -> bool:
+    """判断页面是否为可安全回收的空白残留页。"""
+    try:
+        if page.is_closed():
+            return False
+        page_url = (page.url or "").strip().lower()
+        return page_url in ("", "about:blank", "data:,")
+    except Exception:
+        return False
+
+
+async def _cleanup_launcher_blank_pages(
+    browser: AsyncBrowser,
+    keep_context: Optional[AsyncBrowserContext],
+    keep_page: Optional[AsyncPage],
+) -> None:
+    """回收启动器遗留的空白页，避免出现额外 Camoufox 空窗口。"""
+    closed_count = 0
+    for context in _iter_browser_contexts(browser):
+        if keep_context is not None and context is keep_context:
+            continue
+        pages = getattr(context, "pages", [])
+        if not isinstance(pages, (list, tuple)):
+            continue
+        for page in list(pages):
+            if keep_page is not None and page is keep_page:
+                continue
+            if not _is_disposable_blank_page(page):
+                continue
+            try:
+                await page.close()
+                closed_count += 1
+            except Exception as close_err:
+                logger.debug(
+                    f"[BrowserReuse] Failed to close disposable blank page: {close_err}"
+                )
+    if closed_count > 0:
+        logger.info(
+            f"[BrowserReuse] Closed {closed_count} disposable blank launcher page(s)."
+        )
+
+
 def _match_ai_studio_prompt_page(
     page: AsyncPage, target_url_base: str
 ) -> Optional[str]:
@@ -520,6 +562,7 @@ async def initialize_page_logic(  # pragma: no cover
             )
 
         await found_page.bring_to_front()
+        await _cleanup_launcher_blank_pages(browser, temp_context, found_page)
 
         try:
             # Use centralized selector fallback logic to find input container

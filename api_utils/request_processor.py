@@ -458,26 +458,8 @@ async def _handle_auxiliary_stream_response(
         )
 
         if not result_future.done():
-            response_json_str = json.dumps(response_payload, ensure_ascii=False)
-            if len(response_json_str) > 10000:  # 10KB threshold
-                logger.info(
-                    f"[{req_id}] Large response detected ({len(response_json_str)} chars), using efficient chunking"
-                )
-
-                async def generate_json_chunks():
-                    chunk_size = 8192  # 8KB chunks
-                    for i in range(0, len(response_json_str), chunk_size):
-                        chunk = response_json_str[i : i + chunk_size]
-                        yield chunk
-                        await asyncio.sleep(0.01)
-
-                result_future.set_result(
-                    StreamingResponse(
-                        generate_json_chunks(), media_type="application/json"
-                    )
-                )
-            else:
-                result_future.set_result(JSONResponse(content=response_payload))
+            # 非流式接口始终返回标准 JSON，避免调用方把大响应误判为流式/分块内容。
+            result_future.set_result(JSONResponse(content=response_payload))
         return response_payload
 
 
@@ -622,22 +604,8 @@ async def _handle_playwright_response(
         )
 
         if not result_future.done():
-            response_json_str = json.dumps(response_payload, ensure_ascii=False)
-            if len(response_json_str) > 10000:
-
-                async def generate_json_chunks():
-                    chunk_size = 8192
-                    for i in range(0, len(response_json_str), chunk_size):
-                        yield response_json_str[i : i + chunk_size]
-                        await asyncio.sleep(0.01)
-
-                result_future.set_result(
-                    StreamingResponse(
-                        generate_json_chunks(), media_type="application/json"
-                    )
-                )
-            else:
-                result_future.set_result(JSONResponse(content=response_payload))
+            # 非流式接口始终返回标准 JSON，避免外部 SDK 在降级时解析 chunked JSON 失败。
+            result_future.set_result(JSONResponse(content=response_payload))
 
         return response_payload
 

@@ -259,6 +259,7 @@ class ResponseController(BaseController):
 
         result: Dict[str, Any] = {
             "content": "",
+            "reasoning_content": "",
             "has_function_calls": False,
             "function_calls": [],
             "raw_content": "",
@@ -278,6 +279,13 @@ class ResponseController(BaseController):
                 check_client_disconnected
             )
 
+            if hasattr(self, "_separate_thinking_and_response"):
+                separated_content, reasoning_content = (
+                    self._separate_thinking_and_response(raw_content)
+                )
+            else:
+                separated_content, reasoning_content = raw_content, ""
+
             if has_fc:
                 if FUNCTION_CALLING_DEBUG:
                     self.logger.info(
@@ -285,9 +293,17 @@ class ResponseController(BaseController):
                     )
                 result["has_function_calls"] = True
                 result["function_calls"] = function_calls
+                if hasattr(self, "_separate_thinking_and_response"):
+                    text_content, text_reasoning = self._separate_thinking_and_response(
+                        text_content
+                    )
+                    if text_reasoning:
+                        reasoning_content = text_reasoning
                 result["content"] = text_content
             else:
-                result["content"] = raw_content
+                result["content"] = separated_content
+
+            result["reasoning_content"] = reasoning_content
 
         except Exception as e:
             if isinstance(e, asyncio.CancelledError):

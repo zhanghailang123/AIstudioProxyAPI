@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from playwright.async_api import Error as PlaywrightAsyncError
 
 from api_utils.context_types import RequestContext
@@ -1398,8 +1399,50 @@ async def test_handle_auxiliary_stream_response_non_streaming_success(
 
         assert isinstance(result, dict)
         assert mock_future.done()
-        # Verify result is JSONResponse
-        assert hasattr(mock_future.result(), "body")
+        assert isinstance(mock_future.result(), JSONResponse)
+
+
+@pytest.mark.asyncio
+async def test_handle_auxiliary_stream_response_non_streaming_large_payload_still_jsonresponse(
+    mock_request, mock_context, mock_check_disconnected
+):
+    mock_request.stream = False
+    mock_future = asyncio.Future()
+    mock_locator = MagicMock()
+
+    async def mock_use_stream_response(*args, **kwargs):
+        yield {"done": False, "body": "part1"}
+        yield {"done": True, "body": "x" * 20000, "reason": "stop"}
+
+    large_payload = {
+        "id": "resp-large",
+        "choices": [{"message": {"content": "x" * 20000}}],
+    }
+
+    with (
+        patch(
+            "api_utils.request_processor.use_stream_response",
+            side_effect=mock_use_stream_response,
+        ),
+        patch("api_utils.request_processor.calculate_usage_stats", return_value={}),
+        patch(
+            "api_utils.request_processor.build_chat_completion_response_json",
+            return_value=large_payload,
+        ),
+    ):
+        result = await _handle_auxiliary_stream_response(
+            "req-large",
+            mock_request,
+            mock_context,
+            mock_future,
+            mock_locator,
+            mock_check_disconnected,
+            timeout=30.0,
+        )
+
+        assert isinstance(result, dict)
+        assert mock_future.done()
+        assert isinstance(mock_future.result(), JSONResponse)
 
 
 @pytest.mark.asyncio
@@ -1513,6 +1556,60 @@ async def test_handle_playwright_response_non_streaming(
 
         assert isinstance(result, dict)
         assert mock_future.done()
+        assert isinstance(mock_future.result(), JSONResponse)
+
+
+@pytest.mark.asyncio
+async def test_handle_playwright_response_non_streaming_large_payload_still_jsonresponse(
+    mock_request, mock_context, mock_check_disconnected
+):
+    mock_request.stream = False
+    mock_future = asyncio.Future()
+    mock_locator = MagicMock()
+    mock_page = AsyncMock()
+
+    response_data = {
+        "content": "x" * 20000,
+        "reasoning_content": "",
+        "recovery_method": "direct",
+        "has_function_calls": False,
+    }
+    large_payload = {
+        "id": "resp-large",
+        "choices": [{"message": {"content": "x" * 20000}}],
+    }
+
+    with (
+        patch(
+            "api_utils.request_processor.locate_response_elements",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "api_utils.request_processor.PageController.get_response_with_integrity_check",
+            new_callable=AsyncMock,
+            return_value=response_data,
+        ),
+        patch("api_utils.request_processor.calculate_usage_stats", return_value={}),
+        patch(
+            "api_utils.request_processor.build_chat_completion_response_json",
+            return_value=large_payload,
+        ),
+    ):
+        result = await _handle_playwright_response(
+            "req-large",
+            mock_request,
+            mock_page,
+            mock_context,
+            mock_future,
+            mock_locator,
+            mock_check_disconnected,
+            prompt_length=100,
+            timeout=30.0,
+        )
+
+        assert isinstance(result, dict)
+        assert mock_future.done()
+        assert isinstance(mock_future.result(), JSONResponse)
 
 
 class TestCleanupRequestResources:

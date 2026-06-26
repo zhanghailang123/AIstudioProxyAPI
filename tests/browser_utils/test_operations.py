@@ -297,6 +297,58 @@ async def test_get_final_response_content_fallback_copy(mock_page):
 
 
 @pytest.mark.asyncio
+async def test_get_final_response_content_dom_fallback(mock_page):
+    """Test DOM fallback when edit/copy both fail."""
+    check_disconnect = MagicMock()
+
+    with (
+        patch(
+            "browser_utils.operations.get_response_via_edit_button",
+            new_callable=AsyncMock,
+        ) as mock_edit,
+        patch(
+            "browser_utils.operations.get_response_via_copy_button",
+            new_callable=AsyncMock,
+        ) as mock_copy,
+    ):
+        mock_edit.return_value = None
+        mock_copy.return_value = None
+        mock_page.evaluate.return_value = "DOM fallback content"
+
+        result = await _get_final_response_content(
+            mock_page, "req_id", check_disconnect
+        )
+        assert result == "DOM fallback content"
+
+
+@pytest.mark.asyncio
+async def test_get_final_response_content_dom_fallback_excludes_thoughts(mock_page):
+    """Test DOM fallback strips Thoughts content and keeps final answer."""
+    check_disconnect = MagicMock()
+
+    html_text = "Final answer only"
+
+    with (
+        patch(
+            "browser_utils.operations.get_response_via_edit_button",
+            new_callable=AsyncMock,
+        ) as mock_edit,
+        patch(
+            "browser_utils.operations.get_response_via_copy_button",
+            new_callable=AsyncMock,
+        ) as mock_copy,
+    ):
+        mock_edit.return_value = None
+        mock_copy.return_value = None
+        mock_page.evaluate.return_value = html_text
+
+        result = await _get_final_response_content(
+            mock_page, "req_id", check_disconnect
+        )
+        assert result == "Final answer only"
+
+
+@pytest.mark.asyncio
 async def test_get_raw_text_content_pre_error_with_debug():
     """Test pre element inner_text error with debug logging enabled."""
     element = create_robust_locator()

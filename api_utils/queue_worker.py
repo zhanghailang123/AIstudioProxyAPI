@@ -33,7 +33,43 @@ async def _force_goto_new_chat(page, logger, req_id: str, reason: str) -> bool:
         except Exception:
             pass
         await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        await expect_async(page.locator(INPUT_SELECTOR)).to_be_visible(timeout=15000)
+        input_locator = page.locator(INPUT_SELECTOR)
+        await expect_async(input_locator).to_be_visible(timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=10000)
+        await page.wait_for_function(
+            """
+            (selector) => {
+                const element = document.querySelector(selector);
+                if (!element) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                if (
+                    style.visibility === 'hidden' ||
+                    style.display === 'none' ||
+                    style.pointerEvents === 'none' ||
+                    element.disabled ||
+                    element.readOnly
+                ) {
+                    return false;
+                }
+                const rect = element.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) {
+                    return false;
+                }
+                const x = rect.left + Math.max(4, Math.min(rect.width / 2, rect.width - 4));
+                const y = rect.top + Math.max(4, Math.min(rect.height / 2, rect.height - 4));
+                const topEl = document.elementFromPoint(x, y);
+                if (!topEl) {
+                    return false;
+                }
+                return topEl === element || element.contains(topEl) || topEl.contains(element);
+            }
+            """,
+            arg=INPUT_SELECTOR,
+            timeout=10000,
+        )
+        await page.keyboard.press("Escape")
         logger.info(f"[{req_id}] 页面恢复完成: {target_url}")
         return True
     except Exception as goto_err:
@@ -419,7 +455,12 @@ async def queue_worker() -> None:
                         request_failed = False
                         logger.error(f"[{req_id}] (Worker) Permission denied: {e}")
                     except Exception as e:
-                        logger.error(f"[{req_id}] (Worker) Error: {e}")
+                        if result_future and result_future.done():
+                            logger.warning(
+                                f"[{req_id}] (Worker) Request already completed with error: {e}"
+                            )
+                        else:
+                            logger.error(f"[{req_id}] (Worker) Error: {e}")
                         if result_future and not result_future.done():
                             result_future.set_exception(
                                 server_error(req_id, f"Error: {e}")

@@ -256,6 +256,82 @@ async def test_initialize_page_logic_reuse_disabled_ignores_browser_contexts(
 
 
 @pytest.mark.asyncio
+async def test_initialize_page_logic_closes_blank_launcher_pages(
+    mock_browser,
+    mock_browser_context,
+    mock_page,
+    mock_expect,
+    mock_server_state,
+):
+    with (
+        patch(
+            "browser_utils.initialization.core.setup_network_interception_and_scripts",
+            new_callable=AsyncMock,
+        ),
+        patch("browser_utils.initialization.core.setup_debug_listeners"),
+    ):
+        blank_page = AsyncMock()
+        blank_page.url = "about:blank"
+        blank_page.is_closed = MagicMock(return_value=False)
+        blank_page.close = AsyncMock()
+
+        launcher_context = AsyncMock()
+        launcher_context.pages = [blank_page]
+
+        mock_browser.contexts = [launcher_context]
+        mock_browser_context.pages = []
+        mock_browser_context.new_page.return_value = mock_page
+        mock_page.url = "https://aistudio.google.com/prompts/new_chat"
+        mock_page.locator.return_value.first.inner_text = AsyncMock(
+            return_value="Gemini 1.5 Pro"
+        )
+
+        page, ready = await _initialize_page_logic(mock_browser)
+
+        assert page == mock_page
+        assert ready is True
+        blank_page.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_initialize_page_logic_does_not_close_non_blank_pages(
+    mock_browser,
+    mock_browser_context,
+    mock_page,
+    mock_expect,
+    mock_server_state,
+):
+    with (
+        patch(
+            "browser_utils.initialization.core.setup_network_interception_and_scripts",
+            new_callable=AsyncMock,
+        ),
+        patch("browser_utils.initialization.core.setup_debug_listeners"),
+    ):
+        existing_page = AsyncMock()
+        existing_page.url = "https://example.com/dashboard"
+        existing_page.is_closed = MagicMock(return_value=False)
+        existing_page.close = AsyncMock()
+
+        other_context = AsyncMock()
+        other_context.pages = [existing_page]
+
+        mock_browser.contexts = [other_context]
+        mock_browser_context.pages = []
+        mock_browser_context.new_page.return_value = mock_page
+        mock_page.url = "https://aistudio.google.com/prompts/new_chat"
+        mock_page.locator.return_value.first.inner_text = AsyncMock(
+            return_value="Gemini 1.5 Pro"
+        )
+
+        page, ready = await _initialize_page_logic(mock_browser)
+
+        assert page == mock_page
+        assert ready is True
+        existing_page.close.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_initialize_page_logic_reuse_strict_fails_without_existing_page(
     mock_browser,
     mock_browser_context,

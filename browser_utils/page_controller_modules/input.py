@@ -63,6 +63,146 @@ class InputController(BaseController):
             """
         )
 
+    async def _dismiss_input_blockers(self) -> None:
+        """移除可能拦截输入框点击的透明遮罩和提示层。"""
+        try:
+            await self.page.mouse.move(0, 0)
+        except Exception:
+            pass
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            await self.page.evaluate(
+                """
+                () => {
+                    document.querySelectorAll(
+                        '.cdk-overlay-backdrop,' +
+                        '.cdk-overlay-pane,' +
+                        '.mat-mdc-tooltip,' +
+                        '[role="tooltip"]'
+                    ).forEach((el) => {
+                        if (el.classList.contains('cdk-overlay-backdrop')) {
+                            el.style.pointerEvents = 'none';
+                        }
+                    });
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    async def _is_prompt_interactable(self, prompt_textarea_locator) -> bool:
+        """检查输入框是否处于可安全交互状态。"""
+        try:
+            return bool(
+                await prompt_textarea_locator.evaluate(
+                    """
+                    (element) => {
+                        if (!element || !element.isConnected) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(element);
+                        if (
+                            style.visibility === 'hidden' ||
+                            style.display === 'none' ||
+                            style.pointerEvents === 'none'
+                        ) {
+                            return false;
+                        }
+                        if (element.disabled || element.readOnly) {
+                            return false;
+                        }
+                        const rect = element.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) {
+                            return false;
+                        }
+                        const x = rect.left + Math.max(4, Math.min(rect.width / 2, rect.width - 4));
+                        const y = rect.top + Math.max(4, Math.min(rect.height / 2, rect.height - 4));
+                        const topEl = document.elementFromPoint(x, y);
+                        if (!topEl) {
+                            return false;
+                        }
+                        return topEl === element || element.contains(topEl) || topEl.contains(element);
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    async def _wait_for_prompt_interactable(
+        self, prompt_textarea_locator, timeout_ms: int = 6000
+    ) -> None:
+        """等待恢复后的输入框进入稳定可交互状态。"""
+        deadline = time.perf_counter() + timeout_ms / 1000
+        while time.perf_counter() < deadline:
+            await self._dismiss_input_blockers()
+            if await self._is_prompt_interactable(prompt_textarea_locator):
+                return
+            await asyncio.sleep(0.2)
+        self.logger.warning(
+            "[Input] Prompt interactable wait timed out, continuing with focus fallback."
+        )
+
+    async def _ensure_prompt_focus(self, prompt_textarea_locator) -> None:
+        """优先 focus 建立输入态，仅在必要时退回 click。"""
+        await self._wait_for_prompt_interactable(prompt_textarea_locator)
+        await self._dismiss_input_blockers()
+
+        focus_err = None
+        for attempt in range(2):
+            try:
+                await self._maybe_await(prompt_textarea_locator.focus(timeout=5000))
+                await asyncio.sleep(0.1)
+                active_ok = await self._maybe_await(
+                    prompt_textarea_locator.evaluate(
+                        "(element) => document.activeElement === element"
+                    )
+                )
+                if active_ok:
+                    return
+            except Exception as err:
+                focus_err = err
+                self.logger.warning(
+                    f"[Input] Prompt focus attempt {attempt + 1} failed: {err}"
+                )
+
+        click_err = None
+        try:
+            await self._maybe_await(prompt_textarea_locator.scroll_into_view_if_needed())
+        except Exception:
+            pass
+        try:
+            await self._dismiss_input_blockers()
+            await self._maybe_await(prompt_textarea_locator.click(timeout=5000))
+            await asyncio.sleep(0.1)
+            active_ok = await self._maybe_await(
+                prompt_textarea_locator.evaluate(
+                    "(element) => document.activeElement === element"
+                )
+            )
+            if active_ok:
+                return
+        except Exception as err:
+            click_err = err
+            self.logger.warning(f"[Input] Prompt click fallback failed: {err}")
+
+        self.logger.warning(
+            f"[Input] Prompt focus/click did not activate textarea "
+            f"(focus_err={focus_err}, click_err={click_err}), falling back to JS focus()."
+        )
+        await prompt_textarea_locator.evaluate(
+            """
+            (element) => {
+                element.focus();
+                element.click?.();
+            }
+            """
+        )
+        await asyncio.sleep(0.2)
+
     async def _read_prompt_value(self, prompt_textarea_locator) -> str:
         """读取当前输入框值，兼容 textarea 和 contenteditable。"""
         try:
@@ -127,14 +267,88 @@ class InputController(BaseController):
             prompt,
         )
 
+    async def _bulk_set_prompt_in_chunks(
+        self, prompt_textarea_locator, prompt: str, chunk_size: int = 8000
+    ) -> None:
+        await prompt_textarea_locator.evaluate(
+            """
+            (element) => {
+                element.focus();
+                const proto = Object.getPrototypeOf(element);
+                const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(element, '');
+                } else {
+                    element.value = '';
+                }
+                element.setAttribute('data-value', '');
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'deleteContentBackward',
+                    data: null,
+                }));
+                element.dispatchEvent(new Event('change', {
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            }
+            """
+        )
+
+        prompt_len = len(prompt)
+        for start in range(0, prompt_len, chunk_size):
+            chunk = prompt[start : start + chunk_size]
+            await prompt_textarea_locator.evaluate(
+                """
+                (element, payload) => {
+                    const { chunk, nextValue, isLast } = payload;
+                    element.focus();
+                    const proto = Object.getPrototypeOf(element);
+                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (descriptor && descriptor.set) {
+                        descriptor.set.call(element, nextValue);
+                    } else {
+                        element.value = nextValue;
+                    }
+                    element.setAttribute('data-value', nextValue);
+                    element.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: chunk,
+                    }));
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: chunk,
+                    }));
+                    if (isLast) {
+                        element.dispatchEvent(new Event('change', {
+                            bubbles: true,
+                            cancelable: true,
+                        }));
+                        element.blur();
+                        element.focus();
+                    }
+                }
+                """,
+                {
+                    "chunk": chunk,
+                    "nextValue": prompt[: start + len(chunk)],
+                    "isLast": start + len(chunk) >= prompt_len,
+                },
+            )
+            await asyncio.sleep(0.03)
+
     async def _input_prompt_text(self, prompt_textarea_locator, prompt: str) -> None:
         """根据长度选择输入方式并校验写入结果。"""
         prompt_len = len(prompt)
         threshold = self._long_prompt_threshold()
         started = time.perf_counter()
 
-        await self._maybe_await(prompt_textarea_locator.click(timeout=5000))
-        await asyncio.sleep(0.2)
+        await self._ensure_prompt_focus(prompt_textarea_locator)
 
         if prompt_len > threshold:
             self.logger.info(
@@ -146,13 +360,25 @@ class InputController(BaseController):
                 await asyncio.sleep(0.2)
                 current_value = await self._read_prompt_value(prompt_textarea_locator)
                 if current_value != prompt:
-                    raise ValueError(
-                        f"bulk input verification failed: {len(current_value)} != {prompt_len}"
+                    self.logger.warning(
+                        f"[Input] Bulk input verification mismatch: "
+                        f"{len(current_value)} != {prompt_len}, retrying with chunked bulk input."
                     )
+                    await self._bulk_set_prompt_in_chunks(
+                        prompt_textarea_locator, prompt
+                    )
+                    await asyncio.sleep(0.2)
+                    current_value = await self._read_prompt_value(prompt_textarea_locator)
+                    if current_value != prompt:
+                        raise ValueError(
+                            f"chunked bulk input verification failed: {len(current_value)} != {prompt_len}"
+                        )
+                await self._commit_prompt_events(prompt_textarea_locator)
             except Exception as bulk_err:
                 self.logger.warning(
                     f"[Input] Bulk input failed ({bulk_err}), falling back to fill()."
                 )
+                await self._ensure_prompt_focus(prompt_textarea_locator)
                 await prompt_textarea_locator.fill(prompt, timeout=30000)
                 await asyncio.sleep(0.2)
                 await self._commit_prompt_events(prompt_textarea_locator)
@@ -173,6 +399,7 @@ class InputController(BaseController):
                     f"falling back to fill()."
                 )
                 try:
+                    await self._ensure_prompt_focus(prompt_textarea_locator)
                     await prompt_textarea_locator.fill(prompt, timeout=10000)
                     await asyncio.sleep(0.5)
                     await self._commit_prompt_events(prompt_textarea_locator)

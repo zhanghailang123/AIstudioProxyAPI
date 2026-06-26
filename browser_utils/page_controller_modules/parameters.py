@@ -197,15 +197,16 @@ class ParameterController(BaseController):
             except Exception as pw_err:
                 if isinstance(pw_err, asyncio.CancelledError):
                     raise
-                self.logger.error(
-                    f"Error operating temperature input: {pw_err}. Clearing cache."
+                self.logger.warning(
+                    f"Error operating temperature input: {pw_err}. Skipping adjustment (may be panel not visible)."
                 )
                 page_params_cache.pop("temperature", None)
-                from browser_utils.operations import save_error_snapshot
-
-                await save_error_snapshot(f"temperature_playwright_error_{self.req_id}")
+                # 不保存错误快照，避免产生大量截图
+                # from browser_utils.operations import save_error_snapshot
+                # await save_error_snapshot(f"temperature_playwright_error_{self.req_id}")
                 if isinstance(pw_err, ClientDisconnectedError):
                     raise
+                # 跳过此参数，继续执行
 
     async def _adjust_max_tokens(
         self,
