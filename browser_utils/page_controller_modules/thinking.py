@@ -391,15 +391,22 @@ class ThinkingController(BaseController):
 
             await trigger.scroll_into_view_if_needed()
 
-            # Dismiss any transparent overlays that could intercept the click
+            # Dismiss any overlays that could intercept the click
             try:
                 await self.page.evaluate("""
                     () => {
+                        // Remove all backdrop overlays
                         document.querySelectorAll(
-                            'div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop'
-                        ).forEach(el => el.style.pointerEvents = 'none');
+                            'div.cdk-overlay-backdrop, ' +
+                            'div.cdk-overlay-backdrop.cdk-overlay-transparent-backdrop, ' +
+                            'div.dialog-backdrop-blur-overlay'
+                        ).forEach(el => {
+                            el.style.pointerEvents = 'none';
+                            el.style.display = 'none';
+                        });
                     }
                 """)
+                await asyncio.sleep(0.2)  # Wait for overlay removal
             except Exception:
                 pass
 
@@ -446,7 +453,8 @@ class ThinkingController(BaseController):
             if isinstance(e, asyncio.CancelledError):
                 self.logger.info(f"[{self.req_id}] Thinking level set cancelled.")
                 raise
-            self.logger.error(f"Error setting Thinking Level: {e}")
+            self.logger.warning(f"Error setting Thinking Level: {e}. Skipping adjustment.")
+            # 不阻止请求继续执行
             if isinstance(e, ClientDisconnectedError):
                 raise
 

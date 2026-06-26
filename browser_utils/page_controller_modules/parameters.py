@@ -512,12 +512,13 @@ class ParameterController(BaseController):
         except Exception as e:
             if isinstance(e, asyncio.CancelledError):
                 raise
-            self.logger.error(f"Error adjusting Top P: {e}")
-            from browser_utils.operations import save_error_snapshot
-
-            await save_error_snapshot(f"top_p_error_{self.req_id}")
+            self.logger.warning(f"Error adjusting Top P: {e}. Skipping adjustment (may be panel not visible).")
+            # 不保存错误快照，避免产生大量截图
+            # from browser_utils.operations import save_error_snapshot
+            # await save_error_snapshot(f"top_p_error_{self.req_id}")
             if isinstance(e, ClientDisconnectedError):
                 raise
+            # 跳过此参数，继续执行
 
     async def _ensure_tools_panel_expanded(self, check_client_disconnected: Callable):
         """Ensure tools panel is expanded."""

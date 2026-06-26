@@ -970,6 +970,7 @@ if __name__ == "__main__":
                     DefaultAddons.UBO
                 ],  # Assuming DefaultAddons.UBO exists
                 "window": (1440, 900),
+                "geoip": True,  # 🔥 添加 geoip=True，匹配代理的地理位置，避免 headless 检测
             }
 
             # Correct way to add proxy

@@ -133,8 +133,21 @@ ANTI_AUTOMATION_SCRIPT = r"""
 
     // ── 5. chrome.runtime ───────────────────────────────────────────────────
     // Some CDP implementations leave chrome.runtime in a detectable state.
+    // Headless Chrome may not have window.chrome at all - create it.
     try {
-        if (window.chrome && window.chrome.runtime) {
+        if (!window.chrome) {
+            window.chrome = {};
+        }
+        if (!window.chrome.runtime) {
+            window.chrome.runtime = {
+                connect: function() {},
+                sendMessage: function() {},
+                onMessage: {
+                    addListener: function() {},
+                    removeListener: function() {}
+                }
+            };
+        } else {
             const rt = window.chrome.runtime;
             if (!rt.sendMessage) {
                 Object.defineProperty(rt, 'sendMessage', {
@@ -143,6 +156,30 @@ ANTI_AUTOMATION_SCRIPT = r"""
                 });
             }
         }
+    } catch (_) {}
+
+    // ── 6. Permissions API (Headless detection) ──────────────────────────────
+    // Headless mode returns 'denied' for notifications instantly, real browsers return 'prompt'
+    try {
+        const originalQuery = navigator.permissions.query;
+        navigator.permissions.query = function(parameters) {
+            return originalQuery.call(this, parameters).then(result => {
+                if (result.state === 'denied' && parameters.name === 'notifications') {
+                    const fakeResult = {
+                        state: 'default',
+                        onchange: null
+                    };
+                    return fakeResult;
+                }
+                return result;
+            }).catch(err => {
+                // If query fails, return a fake prompt state
+                return {
+                    state: 'default',
+                    onchange: null
+                };
+            });
+        };
     } catch (_) {}
 })();
 """
