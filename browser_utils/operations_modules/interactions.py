@@ -450,10 +450,48 @@ async def _wait_for_response_completion(
             except ClientDisconnectedError:
                 return False
 
-            # Heuristic completion
+            # Heuristic completion - only trigger if generation is NOT active
+            # and response content is actually available in DOM
             if consecutive_empty_input_submit_disabled_count >= 3:
+                # Check if generation is still active (stop button visible)
+                try:
+                    stop_btn = page.locator('button[aria-label="Stop generating"]')
+                    if await stop_btn.is_visible(timeout=1500):
+                        logger.info(
+                            f"(WaitV3) Heuristic triggered but generation still active (stop button visible). Continuing to wait..."
+                        )
+                        consecutive_empty_input_submit_disabled_count = 0
+                        await asyncio.sleep(2.0)
+                        continue
+                except Exception:
+                    pass
+
+                # Check if response content is actually available in DOM
+                try:
+                    dom_check = await page.evaluate(
+                        """
+                        () => {
+                            const lastTurn = document.querySelector('ms-chat-turn:last-of-type');
+                            if (!lastTurn) return false;
+                            const modelContent = lastTurn.querySelector('[data-turn-role="Model"], .model-prompt-container, ms-prompt-chunk');
+                            if (!modelContent) return false;
+                            const text = modelContent.innerText || modelContent.textContent || '';
+                            return text.trim().length > 0;
+                        }
+                        """
+                    )
+                    if not dom_check:
+                        logger.info(
+                            f"(WaitV3) Heuristic triggered but no response content in DOM yet. Continuing to wait..."
+                        )
+                        consecutive_empty_input_submit_disabled_count = 0
+                        await asyncio.sleep(2.0)
+                        continue
+                except Exception:
+                    pass
+
                 logger.warning(
-                    f"(WaitV3) Response might be complete (heuristic): Input empty, submit disabled, but edit button still has not appeared after {consecutive_empty_input_submit_disabled_count} checks. Assuming complete."
+                    f"(WaitV3) Response might be complete (heuristic): Input empty, submit disabled, edit button not visible, but response content found in DOM after {consecutive_empty_input_submit_disabled_count} checks. Assuming complete."
                 )
                 return True
         else:

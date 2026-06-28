@@ -227,16 +227,95 @@ class InputController(BaseController):
 
     async def _bulk_set_prompt(self, prompt_textarea_locator, prompt: str) -> None:
         """批量写入长提示词，并同步 Angular 表单状态。"""
-        await prompt_textarea_locator.evaluate(
+        self.logger.info(
+            f"[Input] _bulk_set_prompt: {len(prompt)} chars, "
+            f"waiting 1s for page to settle before input..."
+        )
+        await asyncio.sleep(1.0)
+        diag = await prompt_textarea_locator.evaluate(
             """
             (element, text) => {
                 element.focus();
-                const proto = Object.getPrototypeOf(element);
-                const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (descriptor && descriptor.set) {
-                    descriptor.set.call(element, text);
-                } else {
-                    element.value = text;
+                // Bypass ms-autosize-textarea truncation:
+                // 1. Set maxlength to a large value (HTML attribute)
+                // 2. Set component's maxLength property if accessible
+                // 3. Set value via Angular's FormControl if available
+                // 4. Otherwise set value directly and dispatch events
+                const originalMaxlength = element.getAttribute('maxlength');
+                element.setAttribute('maxlength', '999999');
+                // Try to find the ms-autosize-textarea component and set its maxLength
+                let componentMaxLimitSet = false;
+                try {
+                    // Angular stores component instances on DOM elements
+                    // Try to find the component via window.ng or similar
+                    const keys = Object.keys(element);
+                    const ngKeys = keys.filter(k => k.startsWith('__ng'));
+                    for (const key of ngKeys) {
+                        const ngData = element[key];
+                        if (ngData && typeof ngData === 'object') {
+                            // Search for component with maxLength property
+                            const visited = new Set();
+                            const stack = [ngData];
+                            while (stack.length > 0) {
+                                const current = stack.pop();
+                                if (!current || visited.has(current)) continue;
+                                visited.add(current);
+                                if (current.maxLength !== undefined) {
+                                    // Found a component with maxLength, set it to large value
+                                    try {
+                                        current.maxLength = 999999;
+                                        componentMaxLimitSet = true;
+                                    } catch (e) { /* ignore */ }
+                                }
+                                if (current.component && typeof current.component === 'object') {
+                                    stack.push(current.component);
+                                }
+                                // Search nested objects
+                                for (const prop of Object.keys(current)) {
+                                    if (prop === 'component') continue;
+                                    const val = current[prop];
+                                    if (val && typeof val === 'object' && !visited.has(val)) {
+                                        stack.push(val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+                // Try to find Angular FormControl and set value directly
+                let usedFormControl = false;
+                let formControlError = null;
+                try {
+                    const ngContext = element.__ngContext__;
+                    if (ngContext && ngContext !== null) {
+                        for (let i = 0; i < ngContext.length; i++) {
+                            const ctx = ngContext[i];
+                            if (ctx && ctx.component && ctx.component.formControl) {
+                                try {
+                                    ctx.component.formControl.setValue(text, { emitEvent: false });
+                                    usedFormControl = true;
+                                    break;
+                                } catch (fcErr) {
+                                    formControlError = fcErr.message || String(fcErr);
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    formControlError = e.message || String(e);
+                }
+                if (!usedFormControl) {
+                    try {
+                        const proto = Object.getPrototypeOf(element);
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (descriptor && descriptor.set) {
+                            descriptor.set.call(element, text);
+                        } else {
+                            element.value = text;
+                        }
+                    } catch (e) {
+                        formControlError = e.message || String(e);
+                    }
                 }
                 element.setAttribute('data-value', text);
                 element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
@@ -262,14 +341,32 @@ class InputController(BaseController):
                 }));
                 element.blur();
                 element.focus();
+                return {
+                    componentMaxLimitSet: componentMaxLimitSet,
+                    usedFormControl: usedFormControl,
+                    formControlError: formControlError,
+                    valueLength: element.value ? element.value.length : 0,
+                };
             }
             """,
             prompt,
+        )
+        self.logger.info(
+            f"[Input] _bulk_set_prompt diag: "
+            f"componentMaxLimitSet={diag.get('componentMaxLimitSet') if diag else 'N/A'}, "
+            f"usedFormControl={diag.get('usedFormControl') if diag else 'N/A'}, "
+            f"valueLength={diag.get('valueLength') if diag else 'N/A'}, "
+            f"formControlError={diag.get('formControlError') if diag else 'N/A'}"
         )
 
     async def _bulk_set_prompt_in_chunks(
         self, prompt_textarea_locator, prompt: str, chunk_size: int = 8000
     ) -> None:
+        self.logger.info(
+            f"[Input] _bulk_set_prompt_in_chunks: {len(prompt)} chars, "
+            f"chunk_size={chunk_size}, waiting 1s for page to settle..."
+        )
+        await asyncio.sleep(1.0)
         await prompt_textarea_locator.evaluate(
             """
             (element) => {
@@ -297,6 +394,17 @@ class InputController(BaseController):
         )
 
         prompt_len = len(prompt)
+        # Set maxlength to a large value before the loop to bypass Angular's truncation
+        await prompt_textarea_locator.evaluate(
+            """
+            (element) => {
+                const originalMaxlength = element.getAttribute('maxlength');
+                element.setAttribute('maxlength', '999999');
+                // Store original for later restoration
+                element.dataset.originalMaxlength = originalMaxlength || '';
+            }
+            """
+        )
         for start in range(0, prompt_len, chunk_size):
             chunk = prompt[start : start + chunk_size]
             await prompt_textarea_locator.evaluate(
@@ -304,12 +412,31 @@ class InputController(BaseController):
                 (element, payload) => {
                     const { chunk, nextValue, isLast } = payload;
                     element.focus();
-                    const proto = Object.getPrototypeOf(element);
-                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-                    if (descriptor && descriptor.set) {
-                        descriptor.set.call(element, nextValue);
-                    } else {
-                        element.value = nextValue;
+                    // Try to find Angular FormControl and set value directly
+                    let usedFormControl = false;
+                    try {
+                        const ngContext = element.__ngContext__;
+                        if (ngContext && ngContext !== null) {
+                            for (let i = 0; i < ngContext.length; i++) {
+                                const ctx = ngContext[i];
+                                if (ctx && ctx.component && ctx.component.formControl) {
+                                    ctx.component.formControl.setValue(nextValue, { emitEvent: false });
+                                    usedFormControl = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // Ignore
+                    }
+                    if (!usedFormControl) {
+                        const proto = Object.getPrototypeOf(element);
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (descriptor && descriptor.set) {
+                            descriptor.set.call(element, nextValue);
+                        } else {
+                            element.value = nextValue;
+                        }
                     }
                     element.setAttribute('data-value', nextValue);
                     element.dispatchEvent(new InputEvent('beforeinput', {
@@ -341,6 +468,20 @@ class InputController(BaseController):
                 },
             )
             await asyncio.sleep(0.03)
+        # Restore maxlength after all chunks are written
+        await prompt_textarea_locator.evaluate(
+            """
+            (element) => {
+                const originalMaxlength = element.dataset.originalMaxlength;
+                if (originalMaxlength && originalMaxlength !== '999999') {
+                    element.setAttribute('maxlength', originalMaxlength);
+                } else {
+                    element.removeAttribute('maxlength');
+                }
+                delete element.dataset.originalMaxlength;
+            }
+            """
+        )
 
     async def _input_prompt_text(self, prompt_textarea_locator, prompt: str) -> None:
         """根据长度选择输入方式并校验写入结果。"""

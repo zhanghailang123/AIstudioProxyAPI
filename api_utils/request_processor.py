@@ -360,10 +360,21 @@ async def _handle_auxiliary_stream_response(
 
             final_data_from_aux_stream = data
             if data.get("done"):
-                content = data.get("body")
-                reasoning_content = data.get("reason")
-                functions = data.get("function")
+                # Accumulate content from all chunks (DOM fallback may yield content before done=True)
+                if data.get("body"):
+                    content = (content or "") + data.get("body")
+                if data.get("reason"):
+                    reasoning_content = (reasoning_content or "") + data.get("reason")
+                if data.get("function"):
+                    functions = data.get("function")
                 break
+            # Accumulate content from intermediate chunks (e.g., DOM fallback yields content with done=False)
+            if data.get("body"):
+                content = (content or "") + data.get("body")
+            if data.get("reason"):
+                reasoning_content = (reasoning_content or "") + data.get("reason")
+            if data.get("function"):
+                functions = data.get("function")
 
         if (
             final_data_from_aux_stream

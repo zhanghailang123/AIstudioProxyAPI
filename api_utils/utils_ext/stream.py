@@ -75,8 +75,8 @@ async def _try_dom_response_fallback(
         return None
 
     try:
-        from browser_utils.operations import (
-            _get_final_response_content,
+        from browser_utils.operations import _get_final_response_content
+        from browser_utils.operations_modules.interactions import (
             _wait_for_response_completion,
         )
         from config import (
@@ -154,6 +154,59 @@ async def _try_dom_response_fallback(
             # Check for errors again after timeout
             await _check_page_error()
 
+        # If completion timed out, check if generation is still active and retry
+        if not completion_detected and page:
+            from config.selectors import SUBMIT_BUTTON_SELECTOR
+            try:
+                still_generating = False
+                stop_btn = page.locator('button[aria-label="Stop generating"]')
+                if await stop_btn.is_visible(timeout=2000):
+                    still_generating = True
+                else:
+                    submit_btn = page.locator(SUBMIT_BUTTON_SELECTOR)
+                    if await submit_btn.count() > 0:
+                        if await submit_btn.first.is_disabled(timeout=2000):
+                            still_generating = True
+                if still_generating:
+                    logger.warning(
+                        f"[{req_id}] DOM fallback: generation still active after "
+                        f"completion timeout. Waiting additional 60s..."
+                    )
+                    # Wait additional 60s for generation to complete
+                    from browser_utils.operations_modules.interactions import (
+                        _wait_for_response_completion as _wait_extra,
+                    )
+                    extra_completion = await _wait_extra(
+                        page,
+                        prompt_textarea,
+                        submit_button,
+                        edit_button,
+                        req_id,
+                        check_disco,
+                        timeout_ms=60000,  # 60s extra
+                        initial_wait_ms=500,
+                    )
+                    if extra_completion:
+                        logger.info(
+                            f"[{req_id}] DOM fallback: extra wait detected completion"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{req_id}] DOM fallback: extra wait also timed out"
+                        )
+                        # Final error check
+                        await _check_page_error()
+            except (
+                AIStudioPermissionDeniedError,
+                QuotaExceededError,
+                UpstreamError,
+            ):
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"[{req_id}] DOM fallback: extra wait check failed: {e}"
+                )
+
         final_content = await _get_final_response_content(
             page, req_id, check_disco
         )
@@ -169,8 +222,38 @@ async def _try_dom_response_fallback(
         if dom_text and dom_text.strip():
             return dom_text
 
+        # Retry: content might not be rendered yet, wait and try again
         logger.warning(
-            f"[{req_id}] DOM fallback: all extraction methods returned empty"
+            f"[{req_id}] DOM fallback: all extraction methods returned empty. "
+            f"Waiting 10s for content to render, then retrying..."
+        )
+        await asyncio.sleep(10)
+
+        # Check if generation is still active
+        try:
+            stop_btn = page.locator('button[aria-label="Stop generating"]')
+            if await stop_btn.is_visible(timeout=2000):
+                logger.info(
+                    f"[{req_id}] DOM fallback: generation still active after retry wait. "
+                    f"Waiting additional 30s..."
+                )
+                await asyncio.sleep(30)
+        except Exception:
+            pass
+
+        # Retry extraction
+        final_content = await _get_final_response_content(
+            page, req_id, check_disco
+        )
+        if final_content and final_content.strip():
+            return final_content
+
+        dom_text = await pc.get_body_text_only_from_dom()
+        if dom_text and dom_text.strip():
+            return dom_text
+
+        logger.warning(
+            f"[{req_id}] DOM fallback: all extraction methods returned empty after retry"
         )
         return None
 
@@ -725,8 +808,120 @@ async def use_stream_response(
                     # DOM FALLBACK: When MITM proxy is bypassed for GenerateContent
                     # (to preserve browser TLS fingerprint), the stream queue will be
                     # empty. Fall back to DOM-based response extraction.
+                    #
+                    # Before triggering DOM fallback, verify the page has actually
+                    # started generating. If the prompt is still in the textarea
+                    # and submit is enabled, the request may not have been sent
+                    # yet (e.g., waiting for page to process).
                     logger.info(
-                        f"[{req_id}] No stream data (MITM bypassed?). Trying DOM fallback..."
+                        f"[{req_id}] No stream data (MITM bypassed?). Checking page state..."
+                    )
+                    # Wait up to 30s for generation to start (stop button or disabled submit)
+                    generation_started = False
+                    for _ in range(6):
+                        if await check_ui_generation_active():
+                            generation_started = True
+                            break
+                        # Check for page errors that indicate the request failed
+                        try:
+                            page_err = await page.evaluate(
+                                """() => {
+                                    const t = document.body && document.body.innerText || '';
+                                    const l = t.toLowerCase();
+                                    if (l.includes('permission denied') ||
+                                        l.includes('caller does not have permission') ||
+                                        l.includes('please try again') ||
+                                        l.includes('failed to generate') ||
+                                        l.includes('resource_exhausted') ||
+                                        l.includes('rate limit') ||
+                                        l.includes('internal error') ||
+                                        l.includes('network error') ||
+                                        l.includes('something went wrong')) {
+                                        return t.substring(0, 500);
+                                    }
+                                    return null;
+                                }"""
+                            )
+                            if page_err:
+                                logger.warning(
+                                    f"[{req_id}] 🚨 Page error detected before DOM fallback: "
+                                    f"{str(page_err)[:200]}"
+                                )
+                                _raise_ai_studio_page_error(
+                                    req_id,
+                                    page_err,
+                                    prefix="AI Studio page error (pre-DOM fallback)",
+                                )
+                        except (
+                            AIStudioPermissionDeniedError,
+                            QuotaExceededError,
+                            UpstreamError,
+                        ):
+                            raise
+                        except Exception:
+                            pass  # Ignore evaluate errors during error check
+                        await asyncio.sleep(5)
+                    if not generation_started:
+                        # Generation hasn't started after 30s — check if prompt was submitted
+                        try:
+                            prompt_val = await page.locator(
+                                PROMPT_TEXTAREA_SELECTOR
+                            ).input_value()
+                            if prompt_val:
+                                logger.warning(
+                                    f"[{req_id}] Prompt still in textarea after 30s, "
+                                    f"generation not started. Waiting longer..."
+                                )
+                                # Wait another 60s for generation to start
+                                for _ in range(12):
+                                    if await check_ui_generation_active():
+                                        generation_started = True
+                                        break
+                                    await asyncio.sleep(5)
+                        except Exception:
+                            pass
+                    if not generation_started:
+                        logger.error(
+                            f"[{req_id}] Generation did not start within 90s. "
+                            f"Checking for errors..."
+                        )
+                        # Final error check
+                        try:
+                            page_err = await page.evaluate(
+                                """() => {
+                                    const t = document.body && document.body.innerText || '';
+                                    const l = t.toLowerCase();
+                                    if (l.includes('permission denied') ||
+                                        l.includes('caller does not have permission') ||
+                                        l.includes('please try again') ||
+                                        l.includes('failed to generate') ||
+                                        l.includes('resource_exhausted') ||
+                                        l.includes('rate limit') ||
+                                        l.includes('internal error') ||
+                                        l.includes('network error') ||
+                                        l.includes('something went wrong')) {
+                                        return t.substring(0, 500);
+                                    }
+                                    return null;
+                                }"""
+                            )
+                            if page_err:
+                                _raise_ai_studio_page_error(
+                                    req_id,
+                                    page_err,
+                                    prefix="AI Studio page error (generation timeout)",
+                                )
+                        except (
+                            AIStudioPermissionDeniedError,
+                            QuotaExceededError,
+                            UpstreamError,
+                        ):
+                            raise
+                        except Exception:
+                            pass
+                    # Now attempt DOM fallback
+                    logger.info(
+                        f"[{req_id}] Trying DOM fallback..."
                     )
                     dom_content = await _try_dom_response_fallback(
                         req_id, page, logger, check_client_disconnected
